@@ -54,6 +54,7 @@ class BinAssistMCPBinaryContextManager:
         self._binaries: Dict[str, BinaryInfo] = {}
         self._name_counter: Dict[str, int] = {}
         self._lock = threading.RLock()  # Thread safety for binary operations
+        self._python_console = None  # Lazily created native scripting provider
         
     def add_binary(self, binary_view: object, name: Optional[str] = None) -> str:
         """Add a BinaryView to the context with automatic name deduplication
@@ -419,6 +420,41 @@ class BinAssistMCPBinaryContextManager:
         with self._lock:
             return list(self._binaries.keys())
 
+    def execute_python(self, name: str, code: str, address: Optional[str] = None,
+                       timeout_seconds: float = 30.0) -> dict:
+        """Execute code in Binary Ninja's persistent native Python console.
+
+        A single console instance is shared by all binaries in this context,
+        matching Binary Ninja's built-in console behavior. Before each command,
+        the requested BinaryView and address are installed as the current
+        scripting context, which populates magic variables such as ``bv``,
+        ``here``, and ``current_function``.
+
+        Args:
+            name: Name of the BinaryView in this context
+            code: Python source to execute
+            address: Optional address or Binary Ninja expression for ``here``
+            timeout_seconds: Maximum execution time before cancellation
+
+        Returns:
+            Structured console output and execution status
+        """
+        binary_view = self.get_binary(name)
+
+        with self._lock:
+            if self._python_console is None:
+                from .python_console import BinaryNinjaPythonConsole
+                self._python_console = BinaryNinjaPythonConsole()
+            console = self._python_console
+
+        # Do not hold the context lock while running arbitrary user code.
+        return console.execute(
+            binary_view=binary_view,
+            source=code,
+            address=address,
+            timeout_seconds=timeout_seconds,
+        )
+
     def list_binary_info(self) -> Dict[str, BinaryInfo]:
         """Get information about all loaded binaries
 
@@ -450,7 +486,12 @@ class BinAssistMCPBinaryContextManager:
             count = len(self._binaries)
             self._binaries.clear()
             self._name_counter.clear()
+            python_console = self._python_console
+            self._python_console = None
             log.log_info(f"Cleared {count} binaries from context")
+
+        if python_console is not None:
+            python_console.close()
 
     def update_analysis_status(self, name: str):
         """Update the analysis status for a binary

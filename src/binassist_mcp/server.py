@@ -502,6 +502,12 @@ class BinAssistMCPServer:
             "idempotentHint": False,
             "openWorldHint": True
         }
+        PY_EXEC_ANNOTATIONS = {
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": False,
+            "openWorldHint": True
+        }
 
         def _check_analysis_guard(context_manager: BinAssistMCPBinaryContextManager,
                                    filename: str) -> Optional[dict]:
@@ -665,6 +671,46 @@ class BinAssistMCPServer:
                 "name": binary_name,
                 **status
             }
+
+        @mcp.tool(annotations=PY_EXEC_ANNOTATIONS)
+        def py_exec(filename: str, code: str, ctx: Context,
+                    address: Optional[str] = None,
+                    timeout_seconds: float = 30.0) -> dict:
+            """Execute Python code in Binary Ninja's native Python Console.
+
+            This tool uses Binary Ninja's own persistent Python scripting
+            provider, so it behaves like the built-in Console: startup.py is
+            loaded, variables and imports persist across calls, expression
+            results are displayed, and magic variables including bv,
+            current_view, here/current_address, current_function, and
+            current_basic_block are available. It also works when Binary Ninja
+            is running headlessly.
+
+            The executed code has the same permissions as Binary Ninja and can
+            modify the analysis, read or write files, access the network, or
+            invoke other Python APIs. Treat code passed here as trusted code.
+
+            Args:
+                filename: Name of the loaded binary to expose as bv/current_view
+                code: Python source code to execute; may contain multiple lines
+                address: Optional address or Binary Ninja expression to expose
+                         as here/current_address. Defaults to the current UI
+                         offset, previous MCP console address, or entry point.
+                timeout_seconds: Cancel execution after this many seconds
+                                 (default 30, maximum 600)
+
+            Returns:
+                Structured execution result containing status, combined output,
+                stdout, warning and stderr streams, current address/function,
+                timeout state, truncation state, and duration
+            """
+            context_manager: BinAssistMCPBinaryContextManager = ctx.request_context.lifespan_context
+            return context_manager.execute_python(
+                name=filename,
+                code=code,
+                address=address,
+                timeout_seconds=timeout_seconds,
+            )
 
         # Analysis tools
         @mcp.tool(annotations=MODIFY_ANNOTATIONS)
