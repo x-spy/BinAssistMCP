@@ -15,6 +15,7 @@ from .logging import log
 from .function_context import (ContextResolutionError, current_ui_selection, describe_function,
                                context_result, function_key, instruction_at, resolve_function)
 from .analysis_queries import block_page, code_page, function_summary
+from .xref_queries import xref_page
 
 try:
     import binaryninja as bn
@@ -2170,88 +2171,15 @@ class BinAssistMCPTools:
     @handle_exceptions
     @require_binja
     def xrefs(self, address_or_name: str, direction: str = "both",
-              include_calls: bool = True) -> Dict[str, Any]:
-        """Unified cross-reference tool.
-
-        Consolidates: get_call_graph, get_cross_references
-
-        Args:
-            address_or_name: Address or symbol name to analyze
-            direction: Reference direction - 'to', 'from', or 'both'
-            include_calls: Include function call relationships
-
-        Returns:
-            Dictionary with cross-reference information
-        """
-        result = {
-            "target": address_or_name,
-            "direction": direction,
-            "references_to": [],
-            "references_from": [],
-            "call_graph": None
-        }
-
-        addr = self._resolve_symbol(address_or_name)
-        func = self._get_function_by_name_or_address(address_or_name)
-
-        if addr is None and func is None:
-            raise ValueError(f"Could not resolve: {address_or_name}")
-
-        if addr is not None:
-            # Get references TO this address
-            if direction in ("to", "both"):
-                refs = self.bv.get_code_refs(addr)
-                for ref in refs:
-                    ref_func = getattr(ref, "function", None)
-                    result["references_to"].append({
-                        "address": hex(ref.address),
-                        "function": ref_func.name if ref_func else None
-                    })
-
-            # Get references FROM this address (if it's a function)
-            if direction in ("from", "both") and func:
-                for block in func.basic_blocks:
-                    i = block.start
-                    for _, length in block:
-                        for ref in self.bv.get_code_refs_from(i, func=func, arch=block.arch):
-                            targets = list(self.bv.get_functions_at(ref))
-                            target_func = targets[0] if len(targets) == 1 else None
-                            result["references_from"].append({
-                                "from_address": hex(i),
-                                "to_address": hex(ref),
-                                "to_function": target_func.name if target_func else None,
-                                "target_candidates": [describe_function(f) for f in targets[:16]],
-                                "ambiguous_target": len(targets) > 1,
-                            })
-                        i += length
-
-        # Include call graph if requested
-        if include_calls and func:
-            result["call_graph"] = {
-                "function": func.name,
-                "address": hex(func.start),
-                "callers": [],
-                "callees": []
-            }
-
-            # Get callers
-            for ref in self.bv.get_code_refs(func.start):
-                caller_func = getattr(ref, "function", None)
-                if caller_func and caller_func != func:
-                    result["call_graph"]["callers"].append({
-                        "name": caller_func.name,
-                        "address": hex(caller_func.start)
-                    })
-
-            # Get callees
-            if hasattr(func, 'callees'):
-                for callee in func.callees:
-                    result["call_graph"]["callees"].append({
-                        "name": callee.name,
-                        "address": hex(callee.start)
-                    })
-
-        return result
+              include_calls: bool = False, *, scope: str = "auto",
+              function_start=None, architecture=None, platform=None, cursor=None,
+              limit: int = 100, max_output_bytes: int = 32768,
+              scan_limit: int = 2000) -> Dict[str, Any]:
+        """Read a bounded reference page; continue with next_cursor and the same query."""
+        return xref_page(self.bv, address_or_name, direction=direction, include_calls=include_calls,
+                         scope=scope, function_start=function_start, architecture=architecture,
+                         platform=platform, cursor=cursor, limit=limit,
+                         max_output_bytes=max_output_bytes, scan_limit=scan_limit)
 
     @handle_exceptions
     @require_binja

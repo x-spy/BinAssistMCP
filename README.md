@@ -90,7 +90,7 @@ BinAssistMCP provides 48 tools organized into functional categories. Tools inclu
 ### Cross-References (Consolidated)
 | Tool | Description |
 |------|-------------|
-| `xrefs` | **Unified cross-references** - actions: `refs_to`, `refs_from`, `call_graph` |
+| `xrefs` | Bounded code-reference pages with optional, separately labelled native call edges |
 
 ### Comments (Consolidated)
 | Tool | Description |
@@ -322,6 +322,24 @@ Code pages use `offset`, `limit` (default 100 instructions), and `max_output_byt
 
 `analyze_function` scans at most 500 blocks by default. `block_scan` reports exactly which range its counts describe, with a continuation offset. Full instruction counts and the single-component cyclomatic estimate are returned only when all blocks were scanned. Instruction counts use the native instruction count, not byte length. Call-site counts are not labelled call depth, and backward address edges are not labelled loops.
 
+`xrefs` defaults to at most 100 total rows, 32 KiB of serialized output, and 2,000 scan steps per request. `limit` (maximum 1,000), `max_output_bytes` (4–256 KiB), and `scan_limit` (maximum 10,000) are independent budgets shared by all result arrays. `include_calls` now defaults to `false`; set it to `true` to include paginated `call_graph.callers` and `call_graph.callees` within those same budgets. Native possible call edges include tail calls and jumps, retain repeated call sites, and preserve external target addresses even when no Function object exists. Code references are not automatically classified as calls.
+
+Continue by passing `next_cursor` as `cursor` with the same `address_or_name`, `direction`, `scope`, and `include_calls`. The cursor pins the resolved function and resumes at a block, instruction, and target index; it does not rescan the function prefix or build the complete outgoing-reference list. Inspect `has_more`, `stop_reason`, and `streams`: a scan-limited page can be empty and still require continuation. Per-stream `returned` counts this page, `emitted` counts the pages traversed by this cursor, and `total=null` means the total is not yet known. `complete` indicates traversal is exhausted, not that Binary Ninja has discovered every possible runtime target. Long names and candidate lists may be shortened with `details_truncated=true`, while reference addresses remain available through pagination.
+
+Incoming references always target the exact requested address. `scope="auto"` preserves the previous outgoing behavior of scanning the resolved function; use `scope="address"` for just one instruction or `scope="function"` to require a unique function. Function selectors work as with `get_code`. Cursors are bound to the native view and query, expire on server/module restart, and reject detected analysis/context changes. They are not database snapshots: restart pagination after edits or reanalysis, including changes that leave counts unchanged. Native APIs still allocate a reference array for an individual source/query; the plugin only converts the requested entries and frees those arrays within the request.
+
+```json
+{
+  "filename": "sample.exe",
+  "address_or_name": "0x401020",
+  "direction": "from",
+  "function_start": "0x401000",
+  "scope": "function",
+  "limit": 50,
+  "max_output_bytes": 16384
+}
+```
+
 ### Python Console Execution
 
 Call `py_exec` with a name returned by `list_binaries`:
@@ -429,7 +447,7 @@ User: "Analyze the main function and explain what it does"
 Claude uses:
 1. get_functions() - find main
 2. get_code(format='decompile') - get readable code
-3. xrefs(action='refs_from') - find called functions
+3. xrefs(direction='from', include_calls=true) - inspect outgoing references and native possible call edges, following next_cursor
 4. analyze_function() - get complexity metrics
 ```
 

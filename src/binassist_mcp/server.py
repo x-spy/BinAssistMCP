@@ -1322,25 +1322,31 @@ class BinAssistMCPServer:
 
         @mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
         def xrefs(filename: str, address_or_name: str, ctx: Context,
-                      direction: str = "both", include_calls: bool = True):
-            """Unified cross-reference tool (xrefs + call graph).
+                  direction: str = "both", include_calls: bool = False, scope: str = "auto",
+                  function_start: Optional[str] = None, architecture: Optional[str] = None,
+                  platform: Optional[str] = None, cursor: Optional[str] = None,
+                  limit: int = 100, max_output_bytes: int = 32768, scan_limit: int = 2000):
+            """Read bounded code references, with optional paginated native call edges.
 
-            Args:
-                filename: Name of the binary file
-                address_or_name: Address or symbol name
-                direction: 'to', 'from', or 'both'
-                include_calls: Include call graph info
-
-            Returns:
-                Cross-reference information
+            direction is to/from/both. Incoming references target the exact address.
+            scope controls outgoing references: auto scans the resolved function,
+            address queries one instruction, function requires a unique function.
+            Overlaps use UI selection or explicit function_start/architecture/platform.
+            include_calls defaults false. When true, callers/callees share the same
+            TOTAL row/byte/scan budgets as references_to/references_from.
+            Pass next_cursor as cursor with the same query to continue. Cursors pin
+            the function even if UI selection changes. A scan-limited page can be
+            empty and still have more results. Inspect has_more, stop_reason and
+            streams; total=null means not yet known, never zero. Restart after
+            edits or reanalysis: cursors do not freeze the native database.
             """
             context_manager: BinAssistMCPBinaryContextManager = ctx.request_context.lifespan_context
-            guard = _check_analysis_guard(context_manager, filename)
-            if guard:
-                return guard
             binary_view = context_manager.get_binary(filename)
             tools = BinAssistMCPTools(binary_view)
-            return tools.xrefs(address_or_name, direction, include_calls)
+            return tools.xrefs(address_or_name, direction, include_calls, scope=scope,
+                               function_start=function_start, architecture=architecture,
+                               platform=platform, cursor=cursor, limit=limit,
+                               max_output_bytes=max_output_bytes, scan_limit=scan_limit)
 
         # ==================== NEW TOOLS (Phase 7) ====================
 
@@ -1782,7 +1788,7 @@ class BinAssistMCPServer:
         # presenting a query interface. Ownership is based on actual effects,
         # independently of the descriptive MCP annotation.
         analysis_tools = {"get_code", "get_function_low_level_il", "analyze_function",
-                          "xrefs", "search_functions_advanced", "get_function_stack_layout"}
+                          "search_functions_advanced", "get_function_stack_layout"}
         control_tools = {"py_status", "py_cancel", "get_task_status", "cancel_task", "list_tasks"}
 
         def offload(function):
