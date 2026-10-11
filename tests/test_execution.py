@@ -237,3 +237,25 @@ def test_idle_state_is_not_sufficient_for_completion(aborted, complete):
     assert state["idle"]
     assert state["complete"] is complete
     assert state["aborted"] is aborted
+
+
+def test_tracing_excludes_installed_plugin_namespace(monkeypatch):
+    import importlib.util
+    import sys
+    from types import ModuleType
+    from binassist_mcp import execution, execution_scope
+
+    package = "BinAssistMCP.src.binassist_mcp"
+    for name in ("BinAssistMCP", "BinAssistMCP.src", package):
+        parent = ModuleType(name)
+        parent.__path__ = []
+        monkeypatch.setitem(sys.modules, name, parent)
+    monkeypatch.setitem(sys.modules, package + ".execution", execution)
+    spec = importlib.util.spec_from_file_location(package + ".execution_scope", execution_scope.__file__)
+    installed = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(installed)
+    frame = SimpleNamespace(f_code=execution.Execution.checkpoint.__code__,
+                            f_globals={"__name__": package + ".execution"})
+    assert not installed.ExecutionScope._user_frame(frame)
+    frame.f_globals["__name__"] = "user_analysis_helpers"
+    assert installed.ExecutionScope._user_frame(frame)

@@ -20,6 +20,7 @@ _THREAD_START = threading.Thread.start.__code__
 _POOL_SUBMIT = ThreadPoolExecutor.submit.__code__
 _EXECUTOR_ENTER = Executor.__enter__.__code__
 _STDLIB = getattr(sys, "stdlib_module_names", frozenset())
+_INTERNAL_PACKAGE = __package__
 MAX_CHILD_THREADS = 64
 
 
@@ -37,8 +38,11 @@ class ExecutionScope:
         filename = frame.f_code.co_filename
         if filename.startswith("<binassist:"):
             return True
-        module = frame.f_globals.get("__name__", "").split(".")[0]
-        return (module not in _STDLIB and module not in {"binaryninja", "binassist_mcp"}
+        qualified_module = frame.f_globals.get("__name__", "")
+        module = qualified_module.split(".")[0]
+        internal = (qualified_module == _INTERNAL_PACKAGE
+                    or qualified_module.startswith(_INTERNAL_PACKAGE + "."))
+        return (module not in _STDLIB and module != "binaryninja" and not internal
                 and not filename.startswith("<frozen ")
                 and frame.f_code.co_name != "__del__")
 
