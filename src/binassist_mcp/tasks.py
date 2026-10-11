@@ -1,37 +1,35 @@
-"""
-Async task management for BinAssistMCP
-
-This module provides task management for long-running operations like
-decompilation and analysis, preventing blocking of the MCP connection.
-"""
+"""Bounded background tasks with truthful cancellation and retained handles."""
 
 import asyncio
+import inspect
+import json
+import threading
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
 from datetime import datetime
-import threading
-
-from .logging import log
+from enum import Enum
+from typing import Any, Dict, Optional
 
 
 class TaskStatus(Enum):
-    """Task execution status"""
     PENDING = "pending"
     RUNNING = "running"
+    CANCEL_REQUESTED = "cancel_requested"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
 
+TERMINAL = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+
+
 @dataclass
 class McpTask:
-    """Represents an async MCP task"""
     id: str
     name: str
-    status: TaskStatus
-    progress: float = 0.0  # 0.0 to 1.0
+    status: TaskStatus = TaskStatus.PENDING
+    owner: str = "default"
+    progress: float = 0.0
     result: Optional[Any] = None
     error: Optional[str] = None
     created_at: datetime = field(default_factory=datetime.now)
@@ -39,265 +37,184 @@ class McpTask:
     completed_at: Optional[datetime] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert task to dictionary representation"""
-        return {
-            "id": self.id,
-            "name": self.name,
-            "status": self.status.value,
-            "progress": self.progress,
-            "result": self.result,
-            "error": self.error,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "started_at": self.started_at.isoformat() if self.started_at else None,
-            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
-            "metadata": self.metadata
-        }
+    def to_dict(self):
+        return {"id": self.id, "name": self.name, "status": self.status.value,
+                "progress": self.progress, "result": self.result, "error": self.error,
+                "created_at": self.created_at.isoformat(),
+                "started_at": self.started_at.isoformat() if self.started_at else None,
+                "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+                "metadata": dict(self.metadata), "still_running": self.status not in TERMINAL}
 
 
 class TaskManager:
-    """Manages async tasks for long-running operations"""
-
-    def __init__(self, max_tasks: int = 100, cleanup_completed_after: int = 300):
-        """Initialize the task manager.
-
-        Args:
-            max_tasks: Maximum number of tasks to keep in memory
-            cleanup_completed_after: Seconds after which completed tasks are removed
-        """
-        self._tasks: Dict[str, McpTask] = {}
+    def __init__(self, max_tasks=100, cleanup_completed_after=300):
+        self._tasks = {}
+        self._running_futures = {}
+        self._cancel_callbacks = {}
+        self._async_tasks = set()
         self._lock = threading.RLock()
         self._max_tasks = max_tasks
         self._cleanup_after = cleanup_completed_after
-        self._running_futures: Dict[str, asyncio.Future] = {}
+        self._closed = False
 
-    async def submit(self, func: Callable, name: str = "task", *args, **kwargs) -> str:
-        """Submit a task for async execution.
+    def _cleanup_old_tasks(self):
+        now = datetime.now()
+        for task_id, task in list(self._tasks.items()):
+            if task.completed_at and (now - task.completed_at).total_seconds() > self._cleanup_after:
+                self._tasks.pop(task_id)
+        if len(self._tasks) >= self._max_tasks:
+            for task_id, task in list(self._tasks.items()):
+                if task.status in TERMINAL:
+                    self._tasks.pop(task_id)
+                    if len(self._tasks) < self._max_tasks:
+                        break
 
-        Args:
-            func: Callable to execute (can be sync or async)
-            name: Human-readable task name
-            *args: Arguments for the function
-            **kwargs: Keyword arguments for the function
-
-        Returns:
-            Task ID for tracking
-        """
-        task_id = str(uuid.uuid4())
-
+    async def submit(self, func, name="task", *args, owner="default", cancel_callback=None,
+                     metadata=None, **kwargs):
         with self._lock:
-            # Cleanup old tasks if needed
             self._cleanup_old_tasks()
-
-            task = McpTask(
-                id=task_id,
-                name=name,
-                status=TaskStatus.PENDING,
-                progress=0.0
-            )
-            self._tasks[task_id] = task
-
-        # Start the task execution
-        asyncio.create_task(self._run_task(task_id, func, *args, **kwargs))
-        log.log_info(f"Task {task_id} ({name}) submitted")
-
+            if self._closed:
+                raise RuntimeError("Task manager is closed")
+            if len(self._tasks) >= self._max_tasks:
+                raise RuntimeError("Task capacity reached; wait for active tasks")
+            task_id = uuid.uuid4().hex
+            self._tasks[task_id] = McpTask(task_id, name, owner=owner, metadata=metadata or {})
+            if cancel_callback is not None:
+                self._cancel_callbacks[task_id] = cancel_callback
+            if inspect.iscoroutinefunction(func):
+                self._async_tasks.add(task_id)
+            future = asyncio.create_task(self._run_task(task_id, func, args, kwargs))
+            self._running_futures[task_id] = future
+            future.add_done_callback(lambda done: self._finished_future(task_id, done))
         return task_id
 
-    async def _run_task(self, task_id: str, func: Callable, *args, **kwargs):
-        """Internal method to run a task."""
+    def _finished_future(self, task_id, future):
         with self._lock:
-            if task_id not in self._tasks:
-                return
-            task = self._tasks[task_id]
-            task.status = TaskStatus.RUNNING
-            task.started_at = datetime.now()
+            self._running_futures.pop(task_id, None)
+            self._cancel_callbacks.pop(task_id, None)
+            self._async_tasks.discard(task_id)
+            task = self._tasks.get(task_id)
+            if task is not None and future.cancelled() and task.status not in TERMINAL:
+                task.status = TaskStatus.CANCELLED
+                task.completed_at = datetime.now()
 
+    async def _run_task(self, task_id, func, args, kwargs):
+        with self._lock:
+            task = self._tasks[task_id]
+            if task.status == TaskStatus.CANCELLED:
+                return
+            if task.status == TaskStatus.CANCEL_REQUESTED and task_id not in self._cancel_callbacks:
+                task.status = TaskStatus.CANCELLED
+                task.completed_at = datetime.now()
+                return
+            if task.status != TaskStatus.CANCEL_REQUESTED:
+                task.status = TaskStatus.RUNNING
+            task.started_at = datetime.now()
         try:
-            # Execute the function
-            if asyncio.iscoroutinefunction(func):
+            if inspect.iscoroutinefunction(func):
                 result = await func(*args, **kwargs)
             else:
-                # Run sync function in executor
-                loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(None, lambda: func(*args, **kwargs))
-
+                result = await asyncio.to_thread(func, *args, **kwargs)
+            # Retain only bounded JSON, never live native objects.
+            encoded = json.dumps(result, ensure_ascii=False, allow_nan=False)
+            if len(encoded.encode("utf-8")) > 262_144:
+                result = {"truncated": True, "message": "Task result exceeds 256 KiB; use bounded batches"}
+            else:
+                result = json.loads(encoded)
             with self._lock:
-                if task_id in self._tasks:
-                    task = self._tasks[task_id]
-                    task.status = TaskStatus.COMPLETED
+                task.result = result
+                failed = isinstance(result, dict) and result.get("success") is False
+                execution_status = (result.get("status") if isinstance(result, dict)
+                                    and result.get("execution_id") and result.get("still_running") is False
+                                    else None)
+                execution_terminal = {"ok": TaskStatus.COMPLETED, "cancelled": TaskStatus.CANCELLED,
+                                      "timeout": TaskStatus.FAILED, "input_required": TaskStatus.FAILED,
+                                      "error": TaskStatus.FAILED}
+                task.status = execution_terminal.get(
+                    execution_status,
+                    TaskStatus.CANCELLED if task.status == TaskStatus.CANCEL_REQUESTED
+                    else TaskStatus.FAILED if failed else TaskStatus.COMPLETED,
+                )
+                if task.status == TaskStatus.COMPLETED:
                     task.progress = 1.0
-                    task.result = result
-                    task.completed_at = datetime.now()
-
-            log.log_info(f"Task {task_id} completed successfully")
-
+                task.completed_at = datetime.now()
         except asyncio.CancelledError:
             with self._lock:
-                if task_id in self._tasks:
-                    task = self._tasks[task_id]
-                    task.status = TaskStatus.CANCELLED
-                    task.completed_at = datetime.now()
-            log.log_info(f"Task {task_id} was cancelled")
-
-        except Exception as e:
+                task.status = TaskStatus.CANCELLED
+                task.completed_at = datetime.now()
+            raise
+        except BaseException as exc:
             with self._lock:
-                if task_id in self._tasks:
-                    task = self._tasks[task_id]
-                    task.status = TaskStatus.FAILED
-                    task.error = str(e)
-                    task.completed_at = datetime.now()
-            log.log_error(f"Task {task_id} failed: {e}")
+                task.status = TaskStatus.FAILED
+                task.error = f"{type(exc).__name__}: {exc}"[:4096]
+                task.completed_at = datetime.now()
 
-    def get_task(self, task_id: str) -> Optional[McpTask]:
-        """Get a task by ID.
-
-        Args:
-            task_id: Task ID to retrieve
-
-        Returns:
-            McpTask if found, None otherwise
-        """
-        with self._lock:
-            return self._tasks.get(task_id)
-
-    def get_task_status(self, task_id: str) -> Dict[str, Any]:
-        """Get task status as a dictionary.
-
-        Args:
-            task_id: Task ID to check
-
-        Returns:
-            Task status dictionary
-        """
+    def get_task(self, task_id, owner=None):
         with self._lock:
             task = self._tasks.get(task_id)
-            if not task:
-                return {
-                    "id": task_id,
-                    "error": "Task not found",
-                    "status": "unknown"
-                }
-            return task.to_dict()
+            return task if task is not None and (owner is None or task.owner == owner) else None
 
-    def update_progress(self, task_id: str, progress: float, metadata: Dict[str, Any] = None):
-        """Update task progress.
-
-        Args:
-            task_id: Task ID to update
-            progress: Progress value (0.0 to 1.0)
-            metadata: Optional metadata to update
-        """
+    def get_task_status(self, task_id, owner=None):
         with self._lock:
-            if task_id in self._tasks:
-                task = self._tasks[task_id]
+            task = self.get_task(task_id, owner)
+            return task.to_dict() if task else {"id": task_id, "status": "unknown", "error": "Task not found"}
+
+    def update_progress(self, task_id, progress, metadata=None):
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is not None and task.status not in TERMINAL:
                 task.progress = max(0.0, min(1.0, progress))
                 if metadata:
                     task.metadata.update(metadata)
 
-    def cancel_task(self, task_id: str) -> bool:
-        """Cancel a running task.
-
-        Args:
-            task_id: Task ID to cancel
-
-        Returns:
-            True if cancellation was initiated, False otherwise
-        """
+    def cancel_task(self, task_id, owner=None):
         with self._lock:
-            if task_id not in self._tasks:
+            task = self.get_task(task_id, owner)
+            if task is None or task.status in TERMINAL:
                 return False
-
-            task = self._tasks[task_id]
-            if task.status not in (TaskStatus.PENDING, TaskStatus.RUNNING):
-                return False
-
-            task.status = TaskStatus.CANCELLED
-            task.completed_at = datetime.now()
-
-        # Cancel the asyncio task if running
-        if task_id in self._running_futures:
+            task.status = TaskStatus.CANCEL_REQUESTED
+            callback = self._cancel_callbacks.get(task_id)
             future = self._running_futures.get(task_id)
-            if future and not future.done():
-                future.cancel()
-
-        log.log_info(f"Task {task_id} cancellation requested")
+            # Pure coroutine tasks can be cancelled. Running sync functions and
+            # native Python jobs must acknowledge completion themselves.
+            cancel_future = callback is None and task_id in self._async_tasks
+        if callback is not None:
+            callback()
+        elif cancel_future and future is not None:
+            future.get_loop().call_soon_threadsafe(future.cancel)
         return True
 
-    def list_tasks(self, status_filter: Optional[TaskStatus] = None) -> List[Dict[str, Any]]:
-        """List all tasks, optionally filtered by status.
-
-        Args:
-            status_filter: Optional status to filter by
-
-        Returns:
-            List of task dictionaries
-        """
+    def list_tasks(self, status_filter=None, owner=None):
         with self._lock:
-            tasks = []
-            for task in self._tasks.values():
-                if status_filter is None or task.status == status_filter:
-                    tasks.append(task.to_dict())
-            return tasks
-
-    def _cleanup_old_tasks(self):
-        """Clean up old completed tasks to prevent memory growth."""
-        now = datetime.now()
-        tasks_to_remove = []
-
-        for task_id, task in self._tasks.items():
-            # Remove completed tasks older than cleanup_after
-            if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
-                if task.completed_at:
-                    age = (now - task.completed_at).total_seconds()
-                    if age > self._cleanup_after:
-                        tasks_to_remove.append(task_id)
-
-        # Also remove excess tasks if we're over the limit
-        if len(self._tasks) - len(tasks_to_remove) >= self._max_tasks:
-            # Remove oldest completed tasks first
-            completed_tasks = [
-                (tid, t) for tid, t in self._tasks.items()
-                if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
-                and tid not in tasks_to_remove
-            ]
-            completed_tasks.sort(key=lambda x: x[1].completed_at or datetime.min)
-
-            excess = len(self._tasks) - len(tasks_to_remove) - self._max_tasks + 10
-            for tid, _ in completed_tasks[:excess]:
-                tasks_to_remove.append(tid)
-
-        for task_id in tasks_to_remove:
-            del self._tasks[task_id]
-            self._running_futures.pop(task_id, None)
-
-        if tasks_to_remove:
-            log.log_debug(f"Cleaned up {len(tasks_to_remove)} old tasks")
+            return [task.to_dict() for task in self._tasks.values()
+                    if (status_filter is None or task.status == status_filter)
+                    and (owner is None or task.owner == owner)]
 
     def clear_completed(self):
-        """Clear all completed, failed, and cancelled tasks."""
         with self._lock:
-            tasks_to_remove = [
-                tid for tid, task in self._tasks.items()
-                if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
-            ]
-            for task_id in tasks_to_remove:
-                del self._tasks[task_id]
-                self._running_futures.pop(task_id, None)
+            for task_id, task in list(self._tasks.items()):
+                if task.status in TERMINAL:
+                    self._tasks.pop(task_id)
 
-            log.log_info(f"Cleared {len(tasks_to_remove)} completed tasks")
+    async def close(self):
+        with self._lock:
+            self._closed = True
+            ids = list(self._running_futures)
+        for task_id in ids:
+            self.cancel_task(task_id)
+        futures = list(self._running_futures.values())
+        if futures:
+            await asyncio.wait(futures, timeout=1)
 
-    def __len__(self) -> int:
-        """Return the number of tasks."""
+    def __len__(self):
         with self._lock:
             return len(self._tasks)
 
 
-# Global task manager instance
-_task_manager: Optional[TaskManager] = None
+_task_manager = None
 
 
-def get_task_manager() -> TaskManager:
-    """Get the global task manager instance."""
+def get_task_manager():
     global _task_manager
     if _task_manager is None:
         _task_manager = TaskManager()
@@ -305,6 +222,5 @@ def get_task_manager() -> TaskManager:
 
 
 def reset_task_manager():
-    """Reset the global task manager (for testing)."""
     global _task_manager
     _task_manager = None

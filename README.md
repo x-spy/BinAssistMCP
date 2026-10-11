@@ -10,8 +10,8 @@ BinAssistMCP is a powerful bridge between Binary Ninja and Large Language Models
 
 - **MCP 2025-11-25 Compliant**: Full support for tool annotations, resources, and prompts
 - **Dual Transport Support**: SSE (Server-Sent Events) and Streamable HTTP transports
-- **45 Consolidated Tools**: Streamlined Binary Ninja API wrapper with unified tool design
-- **Native Python Console**: Execute persistent Binary Ninja Python Console commands through MCP, including in headless mode
+- **48 Consolidated Tools**: Streamlined Binary Ninja API wrapper with unified tool design
+- **Managed Python Scripts**: Complete scripts on the native interpreter, isolated sessions, bounded output, progress and cooperative cancellation, including headless mode
 - **8 MCP Resources**: Browsable, cacheable binary metadata
 - **7 Guided Prompts**: Pre-built workflows for common reverse engineering tasks
 - **Multi-Binary Sessions**: Concurrent analysis of multiple binaries with intelligent context management
@@ -37,6 +37,9 @@ src/binassist_mcp/
 ├── server.py        # FastMCP server - SSE/Streamable HTTP transport, tool registration
 ├── tools.py         # Binary Ninja API wrapper used by MCP tools
 ├── python_console.py # Native Binary Ninja Python Console bridge
+├── execution.py     # Bounded output and execution lifecycle records
+├── execution_scope.py # Cooperative tracing and managed child-thread lifetimes
+├── analysis_helpers.py # Script batching, IL and undo helpers
 ├── plugin.py        # Binary Ninja plugin integration
 ├── context.py       # Thread-safe multi-binary session management
 ├── config.py        # Pydantic configuration with Binary Ninja settings
@@ -52,9 +55,9 @@ __init__.py          # Plugin entry point (root level)
 
 ---
 
-## Tools (45 Total)
+## Tools (48 Total)
 
-BinAssistMCP provides 45 tools organized into functional categories. Tools include MCP annotations (`readOnlyHint`, `idempotentHint`) to help clients make informed decisions.
+BinAssistMCP provides 48 tools organized into functional categories. Tools include MCP annotations (`readOnlyHint`, `idempotentHint`) to help clients make informed decisions.
 
 ### Binary Management
 | Tool | Description |
@@ -68,7 +71,10 @@ BinAssistMCP provides 45 tools organized into functional categories. Tools inclu
 ### Python Console
 | Tool | Description |
 |------|-------------|
-| `py_exec` | Execute code in Binary Ninja's native, persistent Python Console with `bv`, `here`, `current_function`, `startup.py`, REPL output, and headless support |
+| `py_exec` | Execute a complete script with `bv`, `here`, persistent variables, progress and optional background execution |
+| `py_status` | Read actual execution state and paginated output/results |
+| `py_cancel` | Request cooperative cancellation; inspect `still_running` for completion |
+| `py_reset` | Release an idle session and clear its variables and history |
 
 ### Code Analysis (Consolidated)
 | Tool | Description |
@@ -206,7 +212,7 @@ The `trace_network_data` prompt guides analysis of network communication:
 ### Prerequisites
 
 - **Binary Ninja**: Version 4000 or higher
-- **Python**: 3.8+ (typically bundled with Binary Ninja)
+- **Python**: 3.10+ (required by the MCP dependency; typically bundled with Binary Ninja)
 - **Platform**: Windows, macOS, or Linux
 
 NOTE: Windows users should start with: [BinAssistMCP on Windows](binassistmcp-on-windows.md)
@@ -299,17 +305,76 @@ Call `py_exec` with a name returned by `list_binaries`:
 }
 ```
 
-The result contains the same displayed expression value and output you would
-see in Binary Ninja's built-in Python Console. Console variables and imports
-persist across calls. Multi-line code is supported, and the optional `address`
-argument sets `here`, `current_address`, `current_function`, and
-`current_basic_block` for that call. `timeout_seconds` defaults to 30 seconds
-and can be increased up to 600 seconds.
+The default `mode="script"` compiles the complete source before running it once. Compound statements need no REPL separator lines. Syntax errors execute nothing, and an uncaught runtime error stops subsequent statements. The final expression is displayed with a bounded representation. `mode="repl"` accepts a single complete interactive statement. Both modes keep the last displayed value in the session-local `_`, without changing `builtins._`. Both modes catch `SystemExit`, and unattended input returns `input_required` instead of leaving the interpreter waiting for input.
 
-> **Security:** `py_exec` runs trusted Python with the permissions of the
-> Binary Ninja process. It can modify the analysis, access local files and the
-> network, and invoke any installed Python package. Do not expose the MCP
-> endpoint to untrusted clients.
+Variables and imports persist within one client connection, binary and named `session` (default `"default"`). Connections receive independent UUIDs; a new connection or different binary has a separate namespace. Imported modules still share the host Python process and are not sandboxed. `startup.py` still runs when an interpreter is first created. The optional `address`, `function_start` and `architecture` select the current context; ambiguous functions require explicit selection. `py_reset` releases an idle namespace. It refuses to replace a still-running interpreter. New submissions reclaim sessions idle for more than 15 minutes, and the oldest idle session can be evicted when the 32-session capacity is reached. `namespace_id` identifies each incarnation; `namespace_created=true` signals an empty/new namespace, including after eviction. Active sessions are never evicted.
+
+`timeout_seconds` is a cooperative deadline, default 30 seconds and maximum 600, including initialization and queue time. Python executions serialize across all MCP sessions because standard streams are process-global; waiting executions report `queued`. A blocked native operation may outlive its deadline. The result then has `status="cancel_requested"`, `timed_out=true` and `still_running=true`. The underlying database stays reserved until the interpreter and its enrolled child threads finish. Duplicate BinaryView wrappers are deduplicated, and views sharing a native file share the reservation. Mutating tools and analysis-generating queries such as `get_code` reject conflicts. GUI edits are outside this reservation.
+
+Poll `py_status` using its `execution_id`; only `still_running=false` confirms completion. Line/call checks cover scripts and imported user Python modules, including nested calls, while allowing `finally` cleanup after cancellation. Standard-library and Binary Ninja bookkeeping are excluded from line tracing. A script that deliberately catches cancellation, disables tracing, blocks indefinitely in native code, or exits the host process cannot be forcibly contained in this in-process interpreter. Blocking MCP tools run off the transport event loop so status and cancellation remain responsive.
+
+Set `background=true` to return an execution ID immediately. `py_status` accepts `output_offset`/`output_limit` and `result_offset`/`result_limit`; continue with `next_offset` and `next_result_offset`. Response pages default to 16 KiB. Output cursors count characters, while limits count UTF-8 bytes (minimum four bytes so any Unicode code point can fit). `output_complete` only means the current retained page is exhausted; output can grow until execution finishes. Ordinary output retains 64 KiB by default (`max_output_bytes`, 1 KiB to 1 MB), plus a separate 16 KiB diagnostic budget. Error status and structured traceback do not depend on captured stderr. Terminal output, results and progress are immutable. Each session retains eight executions and their source for traceback display, and a context permits 32 sessions. Reset unused sessions to release retained native objects.
+
+`start_task` dispatches registered tools with an `arguments` object. Python tasks report an `execution_id` for output pagination. Task state `cancel_requested` is distinct from `cancelled`; a running synchronous tool is not reported cancelled until it returns. Both `py_cancel` and `cancel_task` produce a cancelled task when the Python execution finishes cancelled. Timeouts, input requests and script errors produce failed tasks with the specific execution status preserved. For example:
+
+```json
+{
+  "name": "Inspect a function batch",
+  "tool_name": "py_exec",
+  "arguments": {
+    "filename": "sample.exe",
+    "code": "for f in mcp.functions(offset=0, limit=50):\n    mcp.emit(mcp.function_status(f))",
+    "timeout_seconds": 60
+  }
+}
+```
+
+Scripts can use the injected `mcp` helper for bounded analysis:
+
+```python
+for index, function in enumerate(mcp.functions(offset=0, limit=50)):
+    mcp.checkpoint(index / 50, function.name)
+    status = mcp.function_status(function)
+    il = mcp.get_il(function, level="hlil", generate=False)
+    status["hlil_available"] = il is not None
+    mcp.emit(status)
+```
+
+`mcp.emit` accepts JSON values, limited to 256 records and 64 KiB per execution. Split larger jobs into batches and paginate results. `mcp.get_il` uses already available IL by default; `generate=True` explicitly allows potentially expensive analysis. `mcp.walk_il(instruction, max_nodes=10000)` iterates nested expressions with cycle and node-budget checks. `mcp.write(text)` captures explicit child-thread output; ordinary child-thread `print` is not automatically associated with the parent execution.
+
+`mcp.functions()` indexes only the requested batch and reuses one native function list within an execution. For paging across executions, create a compact membership snapshot once and keep it in the namespace:
+
+```python
+# First py_exec call. The default limit is 250,000 functions; maximum 1,000,000.
+batch = mcp.function_snapshot()
+len(batch)
+```
+
+```python
+# Later py_exec calls in the same session: advance offset for each batch.
+for function in mcp.functions(offset=100, limit=50, snapshot=batch):
+    mcp.emit(mcp.function_status(function))
+```
+
+Snapshots retain the source view and compact platform/address locators, not Function or IL objects. They resolve fresh objects for each page. Newly discovered functions do not shift existing pages; a removed function produces a stale-snapshot error. Create a new snapshot to include new functions, and use `del batch` when finished.
+
+Ordinary `threading.Thread.start()` calls made by an execution or its enrolled children are automatically enrolled, including daemon threads. `mcp.spawn(target, *args, **kwargs)` offers an explicit equivalent. An execution can start at most 64 threads, reports `active_children`, and drains children and grandchildren before becoming terminal. Child errors fail the execution and request cancellation of remaining work. Use a fresh `ThreadPoolExecutor` inside a `with` block; unscoped pools and submitting to pre-existing external workers are rejected. Low-level `_thread` starts are rejected. Native-created threads, external callback schedulers and subprocesses are not enrolled; keep their lifetimes within the script explicitly. Prefer `mcp.write()` to process-global output redirection in concurrent child code.
+
+```python
+def inspect_bytes(address, view=bv, helper=mcp):
+    helper.emit({"address": hex(address), "bytes": view.read(address, 16).hex()})
+
+mcp.spawn(inspect_bytes, here)
+# Completion is reported only after inspect_bytes returns.
+```
+
+Script completion and analysis completion are separate. Inspect `analysis_at_start`, `analysis`, or `mcp.analysis_status()`. The fields distinguish `idle` from `aborted`; `complete=true` confirms an idle, non-aborted queue and carries `completeness="queue_state_only"`. It does not imply that every function has usable IL: inspect `mcp.function_status()` and IL availability too. `mcp.wait_for_analysis()` rejects aborted analysis and checks completion after waiting. This native wait remains cooperative and may outlive a timeout. Retrieve fresh function/IL objects after reanalysis. `with mcp.undo_group():` groups supported database changes, drains enrolled children before committing or rolling back, and reverts the group on failure or cancellation. Open undo groups on the interpreter thread; nest any `ThreadPoolExecutor` inside the undo group so its workers close before the group exits. Avoid concurrent UI edits during the group. It cannot undo external file/network effects or unsupported native changes.
+
+> **Security:** `py_exec` runs trusted Python with the permissions of the Binary Ninja process. It can modify the analysis, access local files and the network, and invoke any installed Python package. Do not expose the MCP endpoint to untrusted clients.
+
+### Tests
+
+Create an isolated environment with `uv venv`, install `requirements.txt` and `pytest` using `uv pip install`, then run the environment's Python with `-m pytest`. Native integration tests require a licensed Binary Ninja Python API on `PYTHONPATH`; they skip when that API is unavailable. Tests use temporary in-memory BinaryViews and a temporary `startup.py`. The pytest configuration avoids importing the repository's plugin entry point and starting its server during collection.
 
 ### Claude Desktop Configuration
 

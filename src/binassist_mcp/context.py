@@ -7,11 +7,15 @@ with automatic name deduplication and lifecycle management.
 
 import threading
 import time
+import uuid
+import weakref
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
 from .logging import log
+from .analysis_helpers import analysis_state, native_identity
 
 try:
     import binaryninja as bn
@@ -33,8 +37,14 @@ class BinaryInfo:
     analysis_complete: bool = False
     bndb_path: Optional[Path] = None  # Where to save .bndb after analysis
     bndb_saved: bool = False  # Whether .bndb has been saved
+    view_key: tuple = field(init=False)
+    resource_key: tuple = field(init=False)
     
     def __post_init__(self):
+        self.view_key = native_identity(self.view)
+        file = getattr(self.view, "file", None)
+        self.resource_key = (("file",) + native_identity(file) if file is not None
+                             else ("view",) + self.view_key)
         if self.file_path and isinstance(self.file_path, str):
             self.file_path = Path(self.file_path)
         if self.bndb_path and isinstance(self.bndb_path, str):
@@ -54,7 +64,16 @@ class BinAssistMCPBinaryContextManager:
         self._binaries: Dict[str, BinaryInfo] = {}
         self._name_counter: Dict[str, int] = {}
         self._lock = threading.RLock()  # Thread safety for binary operations
-        self._python_console = None  # Lazily created native scripting provider
+        self._python_consoles = {}  # (binary name, session) -> lazy interpreter
+        self._python_last_used = {}
+        self._max_python_sessions = 32
+        self._python_idle_seconds = 900
+        self._python_leases = {}  # native file/view identity -> executing interpreter
+        self._binary_edits = set()
+        self._owners = {}
+        self._closed = False
+        from .tasks import TaskManager
+        self.task_manager = TaskManager()
         
     def add_binary(self, binary_view: object, name: Optional[str] = None) -> str:
         """Add a BinaryView to the context with automatic name deduplication
@@ -76,6 +95,12 @@ class BinAssistMCPBinaryContextManager:
         sanitized_name = self._sanitize_name(name)
 
         with self._lock:
+            if self._closed:
+                raise RuntimeError("Binary context is closed")
+            view_key = native_identity(binary_view)
+            for existing in self._binaries.values():
+                if existing.view_key == view_key:
+                    return existing.name
             # Deduplicate name if needed
             unique_name = self._get_unique_name(sanitized_name)
 
@@ -314,7 +339,7 @@ class BinAssistMCPBinaryContextManager:
 
         # Count functions
         try:
-            status["function_count"] = len(list(bv.functions))
+            status["function_count"] = len(bv.functions)
         except Exception:
             pass
 
@@ -387,7 +412,9 @@ class BinAssistMCPBinaryContextManager:
             # Verify the binary view is still valid
             if not self._is_binary_valid(binary_info.view):
                 log.log_warn(f"Binary '{name}' is no longer valid, removing from context")
-                del self._binaries[name]
+                if not self._resource_busy(name):
+                    self._release_python_sessions(name)
+                    del self._binaries[name]
                 raise KeyError(f"Binary '{name}' is no longer valid")
 
             return binary_info.view
@@ -420,40 +447,134 @@ class BinAssistMCPBinaryContextManager:
         with self._lock:
             return list(self._binaries.keys())
 
-    def execute_python(self, name: str, code: str, address: Optional[str] = None,
-                       timeout_seconds: float = 30.0) -> dict:
-        """Execute code in Binary Ninja's persistent native Python console.
-
-        A single console instance is shared by all binaries in this context,
-        matching Binary Ninja's built-in console behavior. Before each command,
-        the requested BinaryView and address are installed as the current
-        scripting context, which populates magic variables such as ``bv``,
-        ``here``, and ``current_function``.
-
-        Args:
-            name: Name of the BinaryView in this context
-            code: Python source to execute
-            address: Optional address or Binary Ninja expression for ``here``
-            timeout_seconds: Maximum execution time before cancellation
-
-        Returns:
-            Structured console output and execution status
-        """
-        binary_view = self.get_binary(name)
-
+    def start_python(self, name, code, address=None, timeout_seconds=30.0,
+                     session="default", **options):
+        """Reserve the view until actual completion, including after timeout."""
+        from .python_console import BinaryNinjaPythonConsole
+        options.setdefault("submitted_at", time.monotonic())
         with self._lock:
-            if self._python_console is None:
-                from .python_console import BinaryNinjaPythonConsole
-                self._python_console = BinaryNinjaPythonConsole()
-            console = self._python_console
+            if self._closed:
+                raise RuntimeError("Binary context is closed")
+            view = self.get_binary(name)
+            resource = self._binaries[name].resource_key
+            if resource in self._binary_edits:
+                return {"success": False, "status": "busy", "still_running": True,
+                        "message": "Another tool is modifying this binary"}
+            lease = self._python_leases.get(resource)
+            if lease is not None and lease.busy:
+                return lease.busy_result()
+            key = (name, session)
+            now = time.monotonic()
+            for old_key, old_console in list(self._python_consoles.items()):
+                if not old_console.busy and now - self._python_last_used[old_key] > self._python_idle_seconds:
+                    self._python_consoles.pop(old_key).close()
+                    self._python_last_used.pop(old_key)
+            console = self._python_consoles.get(key)
+            if console is None:
+                if len(self._python_consoles) >= self._max_python_sessions:
+                    idle = [k for k, c in self._python_consoles.items() if not c.busy]
+                    if not idle:
+                        raise RuntimeError("All Python sessions are active; retry after completion")
+                    oldest = min(idle, key=self._python_last_used.__getitem__)
+                    self._python_consoles.pop(oldest).close()
+                    self._python_last_used.pop(oldest)
+                console = self._python_consoles[key] = BinaryNinjaPythonConsole()
+            self._python_last_used[key] = now
+            execution = console.start(view, code, address, timeout_seconds, **options)
+            self._python_leases[resource] = console
+            return execution
 
-        # Do not hold the context lock while running arbitrary user code.
-        return console.execute(
-            binary_view=binary_view,
-            source=code,
-            address=address,
-            timeout_seconds=timeout_seconds,
-        )
+    def execute_python(self, name, code, address=None, timeout_seconds=30.0,
+                       session="default", **options):
+        from .python_console import BinaryNinjaPythonConsole
+        execution = self.start_python(name, code, address, timeout_seconds, session, **options)
+        return execution if isinstance(execution, dict) else BinaryNinjaPythonConsole.wait(execution)
+
+    def _python_session(self, name, session):
+        with self._lock:
+            console = self._python_consoles.get((name, session))
+            if console is None:
+                raise KeyError("Python session not found")
+            self._python_last_used[(name, session)] = time.monotonic()
+            return console
+
+    @contextmanager
+    def binary_edit(self, name):
+        """Exclude other tool edits while Python owns this BinaryView."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Binary context is closed")
+            resource = self._binaries[name].resource_key
+            if self._resource_busy(name):
+                raise RuntimeError("Binary is busy; wait for its active execution before modifying it")
+            self._binary_edits.add(resource)
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._binary_edits.discard(resource)
+
+    def _resource_busy(self, name):
+        resource = self._binaries[name].resource_key
+        lease = self._python_leases.get(resource)
+        return resource in self._binary_edits or (lease is not None and lease.busy)
+
+    def owner_for(self, session):
+        """Assign a connection UUID; Python allocation addresses are not owners."""
+        key = id(session)
+        with self._lock:
+            previous = self._owners.get(key)
+            if previous is not None and previous[0]() is session:
+                return previous[1]
+            owner = uuid.uuid4().hex
+
+            def remove(reference):
+                with self._lock:
+                    current = self._owners.get(key)
+                    if current is not None and current[0] is reference:
+                        self._owners.pop(key)
+
+            try:
+                reference = weakref.ref(session, remove)
+            except TypeError:
+                # Non-weakrefable adapters remain retained for this manager's
+                # lifetime, preventing address reuse. Real MCP sessions are weak.
+                reference = lambda: session
+            self._owners[key] = (reference, owner)
+            return owner
+
+    def python_status(self, name, execution_id, session="default", **options):
+        return self._python_session(name, session).status(execution_id, **options)
+
+    def cancel_python(self, name, execution_id, session="default"):
+        return self._python_session(name, session).cancel(execution_id)
+
+    def reset_python(self, name, session="default"):
+        with self._lock:
+            console = self._python_consoles.get((name, session))
+            if console is not None and console.busy:
+                return console.busy_result()
+            if console is not None:
+                del self._python_consoles[(name, session)]
+                self._python_last_used.pop((name, session), None)
+                resource = self._binaries[name].resource_key
+                if self._python_leases.get(resource) is console:
+                    self._python_leases.pop(resource)
+        if console is not None:
+            console.close()
+        return {"success": True, "status": "reset", "variables_cleared": True}
+
+    def _release_python_sessions(self, name):
+        """Caller holds context lock and has verified the view is idle."""
+        retired = []
+        for key in [key for key in self._python_consoles if key[0] == name]:
+            console = self._python_consoles.pop(key)
+            retired.append(console)
+            console.close()
+            self._python_last_used.pop(key, None)
+        resource = self._binaries[name].resource_key
+        if self._python_leases.get(resource) in retired:
+            self._python_leases.pop(resource)
 
     def list_binary_info(self) -> Dict[str, BinaryInfo]:
         """Get information about all loaded binaries
@@ -475,6 +596,9 @@ class BinAssistMCPBinaryContextManager:
         """
         with self._lock:
             if name in self._binaries:
+                if self._resource_busy(name):
+                    return False
+                self._release_python_sessions(name)
                 del self._binaries[name]
                 log.log_info(f"Removed binary '{name}' from context")
                 return True
@@ -483,15 +607,19 @@ class BinAssistMCPBinaryContextManager:
     def clear(self):
         """Clear all binaries from the context"""
         with self._lock:
+            self._closed = True
             count = len(self._binaries)
             self._binaries.clear()
             self._name_counter.clear()
-            python_console = self._python_console
-            self._python_console = None
+            consoles = list(self._python_consoles.values())
+            self._python_consoles.clear()
+            self._python_last_used.clear()
+            self._python_leases.clear()
+            self._owners.clear()
             log.log_info(f"Cleared {count} binaries from context")
 
-        if python_console is not None:
-            python_console.close()
+        for console in consoles:
+            console.close()
 
     def update_analysis_status(self, name: str):
         """Update the analysis status for a binary
@@ -551,47 +679,33 @@ class BinAssistMCPBinaryContextManager:
 
         # Get function count (safe even during analysis)
         try:
-            result["function_count"] = len(list(bv.functions))
+            result["function_count"] = len(bv.functions)
         except Exception:
             pass
 
-        # Read analysis state from BinaryView
-        try:
-            if hasattr(bv, 'analysis_progress'):
-                progress = bv.analysis_progress
-                current_state = progress.state
-
-                if current_state == AnalysisState.IdleState:
-                    result["state"] = "idle"
-                    result["analyzing"] = False
-                    result["analysis_complete"] = True
-                    result["message"] = (
-                        f"Analysis complete. {result['function_count']} functions discovered."
-                    )
-                    # Update the cached flag
-                    with self._lock:
-                        if name in self._binaries:
-                            self._binaries[name].analysis_complete = True
-                            # Auto-save .bndb if analysis just finished and we haven't saved yet
-                            if not info.bndb_saved and info.bndb_path:
-                                self._save_bndb_async(name, bv, info.bndb_path)
-                else:
-                    result["state"] = str(current_state)
-                    result["analyzing"] = True
-                    result["analysis_complete"] = False
-                    result["message"] = (
-                        f"Analysis in progress ({result['state']}). "
-                        f"{result['function_count']} functions discovered so far. "
-                        f"Use get_binary_status to check progress. "
-                        f"Some tools may return incomplete results."
-                    )
-            else:
-                result["state"] = "unknown"
-                result["message"] = "Cannot determine analysis state."
-        except Exception as e:
-            result["state"] = "error"
-            result["message"] = f"Error checking analysis progress: {e}"
-            log.log_debug(f"Error in get_analysis_progress for '{name}': {e}")
+        state = analysis_state(bv)
+        result.update(
+            idle=state["idle"], aborted=state["aborted"],
+            analyzing=not state["idle"] and state["state"] != "unknown" and not state["aborted"],
+            analysis_complete=state["complete"], completeness=state["completeness"],
+        )
+        if state["aborted"]:
+            result["state"] = "aborted"
+            result["message"] = "Analysis is aborted or its workflow is suspended; results may be incomplete."
+        elif state["complete"]:
+            result["state"] = "idle"
+            result["message"] = (
+                f"Analysis queue is idle. {result['function_count']} functions discovered. "
+                "Inspect per-function skip/IL availability before assuming full coverage."
+            )
+        else:
+            result["state"] = state["state"]
+            result["message"] = "Analysis completion is not confirmed; results may be incomplete."
+        with self._lock:
+            if name in self._binaries:
+                self._binaries[name].analysis_complete = state["complete"]
+                if state["complete"] and not info.bndb_saved and info.bndb_path:
+                    self._save_bndb_async(name, bv, info.bndb_path)
 
         return result
 
@@ -606,6 +720,12 @@ class BinAssistMCPBinaryContextManager:
             bv: The BinaryView to save
             bndb_path: Where to save the .bndb file
         """
+        with self._lock:
+            if self._closed or name not in self._binaries or self._resource_busy(name):
+                return
+            resource = self._binaries[name].resource_key
+            self._binary_edits.add(resource)
+
         def _do_save():
             try:
                 bndb_path.parent.mkdir(parents=True, exist_ok=True)
@@ -616,11 +736,19 @@ class BinAssistMCPBinaryContextManager:
                 log.log_info(f"Saved .bndb database to {bndb_path}")
             except Exception as e:
                 log.log_warn(f"Failed to save .bndb to '{bndb_path}': {e}")
+            finally:
+                with self._lock:
+                    self._binary_edits.discard(resource)
 
         save_thread = threading.Thread(
             target=_do_save, name=f"bndb-save-{name}", daemon=True
         )
-        save_thread.start()
+        try:
+            save_thread.start()
+        except BaseException:
+            with self._lock:
+                self._binary_edits.discard(resource)
+            raise
 
     def _extract_name(self, binary_view: object) -> str:
         """Extract name from a BinaryView"""
@@ -690,45 +818,9 @@ class BinAssistMCPBinaryContextManager:
         return None
         
     def _is_analysis_complete(self, binary_view: object) -> bool:
-        """Check if analysis is complete for a BinaryView"""
-        if not BINJA_AVAILABLE or not binary_view or not AnalysisState:
-            return False
-            
-        try:
-            # Method 1: Check analysis_progress state
-            if hasattr(binary_view, 'analysis_progress'):
-                progress = binary_view.analysis_progress
-                current_state = progress.state
-                log.log_debug(f"Analysis progress state: {current_state} (IdleState={AnalysisState.IdleState})")
-                # Correct API: compare state directly to AnalysisState.IdleState
-                return current_state == AnalysisState.IdleState
-                
-            # Method 2: Check analysis_info state (alternative)
-            if hasattr(binary_view, 'analysis_info'):
-                info_state = binary_view.analysis_info.state
-                log.log_debug(f"Analysis info state: {info_state} (IdleState={AnalysisState.IdleState})")
-                return info_state == AnalysisState.IdleState
-                
-            # Fallback: check if we have functions
-            if hasattr(binary_view, 'functions'):
-                func_count = len(list(binary_view.functions))
-                log.log_debug(f"Analysis status fallback: {func_count} functions found")
-                return func_count > 0
-                
-        except Exception as e:
-            log.log_debug(f"Failed to check analysis status: {e}")
-            # Additional debug info
-            try:
-                if hasattr(binary_view, 'analysis_progress'):
-                    progress = binary_view.analysis_progress
-                    log.log_debug(f"Progress object type: {type(progress)}")
-                    log.log_debug(f"Progress state type: {type(progress.state)}")
-                    log.log_debug(f"Available AnalysisState values: {[attr for attr in dir(AnalysisState) if not attr.startswith('_')]}")
-            except Exception as debug_error:
-                log.log_debug(f"Failed to get debug info: {debug_error}")
-            
-        return False
-        
+        """Only confirm an idle, non-aborted analysis queue."""
+        return bool(BINJA_AVAILABLE and binary_view and analysis_state(binary_view)["complete"])
+
     def _is_binary_valid(self, binary_view: object) -> bool:
         """Check if a BinaryView is still valid"""
         if not BINJA_AVAILABLE or not binary_view:
@@ -754,13 +846,18 @@ class BinAssistMCPBinaryContextManager:
         oldest_time = float('inf')
         
         for name, binary_info in self._binaries.items():
+            if self._resource_busy(name):
+                continue
             if binary_info.load_time and binary_info.load_time < oldest_time:
                 oldest_time = binary_info.load_time
                 oldest_name = name
                 
         if oldest_name:
             log.log_info(f"Evicting oldest binary '{oldest_name}' to make room")
+            self._release_python_sessions(oldest_name)
             del self._binaries[oldest_name]
+        else:
+            raise RuntimeError("All loaded binaries have active Python executions")
             
     def __len__(self) -> int:
         """Return the number of loaded binaries"""
@@ -820,6 +917,9 @@ class BinAssistMCPBinaryContextManager:
                     names_to_remove.append(name)
 
             for name in names_to_remove:
+                if self._resource_busy(name):
+                    continue
+                self._release_python_sessions(name)
                 del self._binaries[name]
                 result["removed"].append(name)
                 log.log_info(f"Removed invalid/closed binary '{name}' from context")
@@ -870,7 +970,7 @@ class BinAssistMCPBinaryContextManager:
                         # Check if view object is already tracked
                         already_tracked = False
                         for binary_info in self._binaries.values():
-                            if binary_info.view is bv:
+                            if binary_info.view_key == native_identity(bv):
                                 already_tracked = True
                                 break
 

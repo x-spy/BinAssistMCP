@@ -6,11 +6,14 @@ and comprehensive Binary Ninja integration.
 """
 
 import warnings
+from functools import wraps
 from contextlib import asynccontextmanager
 from threading import Event, Thread
 from typing import AsyncIterator, List, Optional, Union
 
 import asyncio
+import threading
+import time
 from hypercorn.config import Config as HypercornConfig
 from hypercorn.asyncio import serve
 from mcp.server.fastmcp import Context, FastMCP
@@ -113,7 +116,7 @@ class ResourceManagedASGIApp:
 from .config import BinAssistMCPConfig, TransportType
 from .context import BinAssistMCPBinaryContextManager
 from .logging import log
-from .tasks import TaskManager, TaskStatus, get_task_manager
+from .tasks import TaskStatus
 from .tools import BinAssistMCPTools
 
 try:
@@ -212,7 +215,8 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[BinAssistMCPBinaryCo
     finally:
         try:
             log.log_info("Shutting down server, clearing binary context")
-            context_manager.clear()
+            await context_manager.task_manager.close()
+            await asyncio.to_thread(context_manager.clear)
 
             # Give time for async cleanup and stream finalization
             await asyncio.sleep(0.5)
@@ -597,6 +601,9 @@ class BinAssistMCPServer:
                     "analysis_complete": progress["analysis_complete"],
                     "analyzing": progress["analyzing"],
                     "analysis_state": progress["state"],
+                    "analysis_aborted": progress.get("aborted"),
+                    "analysis_idle": progress.get("idle", False),
+                    "completeness": progress.get("completeness", "unknown"),
                     "function_count": progress["function_count"],
                     "bndb_saved": progress["bndb_saved"],
                     "load_time": binary_info.load_time,
@@ -672,45 +679,99 @@ class BinAssistMCPServer:
                 **status
             }
 
-        @mcp.tool(annotations=PY_EXEC_ANNOTATIONS)
-        def py_exec(filename: str, code: str, ctx: Context,
-                    address: Optional[str] = None,
-                    timeout_seconds: float = 30.0) -> dict:
-            """Execute Python code in Binary Ninja's native Python Console.
+        def _owner(ctx):
+            request = ctx.request_context
+            session = getattr(request, "session", None)
+            return request.lifespan_context.owner_for(request if session is None else session)
 
-            This tool uses Binary Ninja's own persistent Python scripting
-            provider, so it behaves like the built-in Console: startup.py is
-            loaded, variables and imports persist across calls, expression
-            results are displayed, and magic variables including bv,
-            current_view, here/current_address, current_function, and
-            current_basic_block are available. It also works when Binary Ninja
-            is running headlessly.
+        def _python_scope(ctx, session):
+            if not session or len(session) > 128:
+                raise ValueError("session must contain 1 to 128 characters")
+            return _owner(ctx) + ":" + session
 
-            The executed code has the same permissions as Binary Ninja and can
-            modify the analysis, read or write files, access the network, or
-            invoke other Python APIs. Treat code passed here as trusted code.
-
-            Args:
-                filename: Name of the loaded binary to expose as bv/current_view
-                code: Python source code to execute; may contain multiple lines
-                address: Optional address or Binary Ninja expression to expose
-                         as here/current_address. Defaults to the current UI
-                         offset, previous MCP console address, or entry point.
-                timeout_seconds: Cancel execution after this many seconds
-                                 (default 30, maximum 600)
-
-            Returns:
-                Structured execution result containing status, combined output,
-                stdout, warning and stderr streams, current address/function,
-                timeout state, truncation state, and duration
-            """
-            context_manager: BinAssistMCPBinaryContextManager = ctx.request_context.lifespan_context
-            return context_manager.execute_python(
-                name=filename,
-                code=code,
-                address=address,
-                timeout_seconds=timeout_seconds,
+        async def _begin_python(ctx, filename, code, address=None, timeout_seconds=30.0,
+                                session="default", mode="script", max_output_bytes=65536,
+                                function_start=None, architecture=None, cancel_event=None):
+            manager = ctx.request_context.lifespan_context
+            submitted_at = time.monotonic()
+            return await asyncio.to_thread(
+                manager.start_python, filename, code, address, timeout_seconds,
+                _python_scope(ctx, session), mode=mode, max_output_bytes=max_output_bytes,
+                function_start=function_start, architecture=architecture,
+                cancel_event=cancel_event, submitted_at=submitted_at,
             )
+
+        @mcp.tool(annotations=PY_EXEC_ANNOTATIONS)
+        async def py_exec(filename: str, code: str, ctx: Context,
+                          address: Optional[str] = None, timeout_seconds: float = 30.0,
+                          session: str = "default", mode: str = "script", background: bool = False,
+                          max_output_bytes: int = 65536, function_start: Optional[str] = None,
+                          architecture: Optional[str] = None) -> dict:
+            """Run trusted Python as one complete script on the native interpreter.
+
+            Variables persist per client, binary and named session. bv, here and
+            current_function are provided. The last expression is displayed with
+            bounded repr. mode='repl' accepts one complete interactive statement.
+            Both modes keep the last displayed value in a session-local _.
+            mcp.checkpoint(), mcp.emit(), mcp.functions() and mcp.get_il() support
+            bounded analysis. mcp.function_snapshot() freezes membership for
+            cross-call paging; pass it as functions(snapshot=...). mcp.spawn()
+            and ordinary threading.Thread children drain before completion.
+            Interactive stdin is unavailable.
+
+            timeout_seconds is a cooperative deadline (0 < timeout <= 600).
+            Native calls may continue: still_running remains true and the binary
+            stays reserved until actual completion. Use py_status/py_cancel with
+            execution_id. Scripts serialize across sessions because stdio is
+            process-global; queue time counts against the deadline.
+            background=True returns immediately. Code can modify
+            analysis, files and network with the permissions of Binary Ninja.
+            """
+            from .python_console import BinaryNinjaPythonConsole
+            cancellation = threading.Event()
+            execution = None
+            try:
+                execution = await _begin_python(
+                    ctx, filename, code, address, timeout_seconds, session, mode,
+                    max_output_bytes, function_start, architecture, cancellation,
+                )
+                if isinstance(execution, dict):
+                    return execution
+                if background:
+                    return execution.snapshot()
+                return await asyncio.to_thread(BinaryNinjaPythonConsole.wait, execution)
+            except asyncio.CancelledError:
+                cancellation.set()
+                if execution is not None and not isinstance(execution, dict):
+                    execution.request_cancel()
+                raise
+
+        @mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
+        def py_status(filename: str, execution_id: str, ctx: Context, session: str = "default",
+                      output_offset: int = 0, output_limit: int = 16384,
+                      result_offset: int = 0, result_limit: int = 100) -> dict:
+            """Read execution state, paged output and mcp.emit JSON records.
+
+            next_offset is a character cursor. An output_complete page may grow
+            while still_running is true. Retains the last 8 executions per session.
+            """
+            return ctx.request_context.lifespan_context.python_status(
+                filename, execution_id, _python_scope(ctx, session),
+                output_offset=output_offset, output_limit=output_limit,
+                result_offset=result_offset, result_limit=result_limit, include_streams=False,
+            )
+
+        @mcp.tool(annotations=PY_EXEC_ANNOTATIONS)
+        def py_cancel(filename: str, execution_id: str, ctx: Context, session: str = "default") -> dict:
+            """Request cooperative cancellation. Check still_running before assuming it stopped."""
+            return ctx.request_context.lifespan_context.cancel_python(
+                filename, execution_id, _python_scope(ctx, session))
+
+        @mcp.tool(annotations=PY_EXEC_ANNOTATIONS)
+        async def py_reset(filename: str, ctx: Context, session: str = "default") -> dict:
+            """Release an idle interpreter and its variables; active executions return busy."""
+            return await asyncio.to_thread(ctx.request_context.lifespan_context.reset_python,
+                                           filename, _python_scope(ctx, session))
 
         # Analysis tools
         @mcp.tool(annotations=MODIFY_ANNOTATIONS)
@@ -1149,7 +1210,7 @@ class BinAssistMCPServer:
         # ==================== CONSOLIDATED TOOLS ====================
         # These unified tools reduce tool count while maintaining functionality
 
-        @mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
+        @mcp.tool(annotations=ANALYSIS_ANNOTATIONS)
         def get_code(filename: str, function_name_or_address: str, ctx: Context,
                     format: str = "decompile") -> dict:
             """Get function code in specified format (unified tool).
@@ -1291,7 +1352,7 @@ class BinAssistMCPServer:
 
         # ==================== NEW TOOLS (Phase 7) ====================
 
-        @mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
+        @mcp.tool(annotations=ANALYSIS_ANNOTATIONS)
         def get_function_low_level_il(filename: str, address_or_name: str, ctx: Context) -> str:
             """Get Low Level IL for a function.
 
@@ -1580,19 +1641,74 @@ class BinAssistMCPServer:
         # ==================== TASK MANAGEMENT TOOLS ====================
 
         @mcp.tool(annotations=MODIFY_ANNOTATIONS)
-        async def start_task(name: str, tool_name: str, ctx: Context) -> dict:
-            """Start an asynchronous background task.
+        async def start_task(name: str, tool_name: str, ctx: Context,
+                             arguments: Optional[dict] = None) -> dict:
+            """Dispatch a registered tool with validated arguments in the background.
 
-            Args:
-                name: Human-readable task name
-                tool_name: Name of the tool to run
+            Python tasks expose execution_id for paged output. Cancellation of
+            running native work is acknowledged only when that work terminates.
             """
-            task_manager = get_task_manager()
-            # Submit a placeholder coroutine; real tool dispatch can be added later
-            async def _noop():
-                return {"message": f"Task '{name}' completed (tool: {tool_name})"}
-            task_id = await task_manager.submit(_noop, name=name)
-            return {"task_id": task_id, "status": "pending", "message": f"Task '{name}' submitted"}
+            excluded = {"start_task", "get_task_status", "cancel_task", "list_tasks",
+                        "py_status", "py_cancel", "py_reset"}
+            tool = mcp._tool_manager.get_tool(tool_name)
+            if tool is None or tool_name in excluded:
+                raise ValueError("Unknown or unsupported background tool")
+            validated = tool.fn_metadata.arg_model.model_validate(arguments or {}).model_dump_one_level()
+            manager = ctx.request_context.lifespan_context
+            task_manager = manager.task_manager
+            owner = _owner(ctx)
+            saved_ctx = Context(request_context=ctx.request_context, fastmcp=mcp)
+            if tool_name == "py_exec":
+                validated.pop("background", None)
+                cancellation = threading.Event()
+                started = asyncio.Event()
+                holder = {}
+                metadata = {"filename": validated["filename"], "session": validated["session"]}
+
+                def request_cancel():
+                    cancellation.set()
+                    if "execution" in holder:
+                        holder["execution"].request_cancel()
+
+                async def run_python():
+                    try:
+                        if cancellation.is_set():
+                            raise asyncio.CancelledError()
+                        execution = await _begin_python(saved_ctx, **validated, cancel_event=cancellation)
+                        if isinstance(execution, dict):
+                            return execution
+                        holder["execution"] = execution
+                        metadata["execution_id"] = execution.id
+                    finally:
+                        started.set()
+                    while not execution.done.is_set():
+                        await asyncio.sleep(0.05)
+                    return execution.snapshot()
+
+                task_id = await task_manager.submit(run_python, name=name, owner=owner,
+                                                    cancel_callback=request_cancel, metadata=metadata)
+                try:
+                    await started.wait()
+                except asyncio.CancelledError:
+                    task_manager.cancel_task(task_id, owner=owner)
+                    raise
+                return {"task_id": task_id, "status": task_manager.get_task_status(task_id)["status"],
+                        **metadata}
+
+            dispatch_cancel = threading.Event()
+
+            async def dispatch():
+                if dispatch_cancel.is_set():
+                    raise asyncio.CancelledError()
+                if tool.is_async:
+                    return await tool.run(validated, context=saved_ctx)
+                return await asyncio.to_thread(lambda: asyncio.run(tool.run(validated, context=saved_ctx)))
+
+            # Sync tool dispatch uses its own cancellation acknowledgement: the
+            # underlying thread must return before its task becomes terminal.
+            task_id = await task_manager.submit(dispatch, name=name, owner=owner,
+                                                cancel_callback=dispatch_cancel.set)
+            return {"task_id": task_id, "status": "pending"}
 
         @mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
         def get_task_status(task_id: str, ctx: Context) -> dict:
@@ -1604,8 +1720,22 @@ class BinAssistMCPServer:
             Returns:
                 Task status including progress, result, and error info
             """
-            task_manager = get_task_manager()
-            return task_manager.get_task_status(task_id)
+            task_manager = ctx.request_context.lifespan_context.task_manager
+            result = task_manager.get_task_status(task_id, owner=_owner(ctx))
+            metadata = result.get("metadata", {})
+            if "execution_id" in metadata:
+                try:
+                    state = ctx.request_context.lifespan_context.python_status(
+                        metadata["filename"], metadata["execution_id"],
+                        _python_scope(ctx, metadata["session"]),
+                        output_limit=4, include_streams=False,
+                    )
+                    result["progress"] = state["progress"]
+                    result["execution_status"] = state["status"]
+                    result["message"] = state["message"]
+                except KeyError:
+                    pass  # Session reset/history eviction does not lose the task result.
+            return result
 
         @mcp.tool(annotations=MODIFY_ANNOTATIONS)
         def cancel_task(task_id: str, ctx: Context) -> dict:
@@ -1617,11 +1747,12 @@ class BinAssistMCPServer:
             Returns:
                 Cancellation result
             """
-            task_manager = get_task_manager()
-            success = task_manager.cancel_task(task_id)
+            task_manager = ctx.request_context.lifespan_context.task_manager
+            success = task_manager.cancel_task(task_id, owner=_owner(ctx))
             return {
                 "task_id": task_id,
-                "cancelled": success,
+                "cancel_requested": success,
+                "status": task_manager.get_task_status(task_id, owner=_owner(ctx))["status"],
                 "message": "Task cancellation initiated" if success else "Task not found or already completed"
             }
 
@@ -1635,14 +1766,55 @@ class BinAssistMCPServer:
             Returns:
                 List of task information
             """
-            task_manager = get_task_manager()
+            task_manager = ctx.request_context.lifespan_context.task_manager
             status_filter = None
             if status:
                 try:
                     status_filter = TaskStatus(status)
-                except ValueError:
-                    pass
-            return task_manager.list_tasks(status_filter)
+                except ValueError as exc:
+                    raise ValueError("Unknown task status") from exc
+            return task_manager.list_tasks(status_filter, owner=_owner(ctx))
+
+        def protect_edit(function, is_async):
+            if is_async:
+                @wraps(function)
+                async def guarded(**kwargs):
+                    manager = kwargs["ctx"].request_context.lifespan_context
+                    with manager.binary_edit(kwargs["filename"]):
+                        return await function(**kwargs)
+            else:
+                @wraps(function)
+                def guarded(**kwargs):
+                    manager = kwargs["ctx"].request_context.lifespan_context
+                    with manager.binary_edit(kwargs["filename"]):
+                        return function(**kwargs)
+            return guarded
+
+        # These operations can generate IL or change analysis options despite
+        # presenting a query interface. Ownership is based on actual effects,
+        # independently of the descriptive MCP annotation.
+        analysis_tools = {"get_code", "get_function_low_level_il", "analyze_function",
+                          "xrefs", "search_functions_advanced", "get_function_stack_layout"}
+        control_tools = {"py_status", "py_cancel", "get_task_status", "cancel_task", "list_tasks"}
+
+        def offload(function):
+            @wraps(function)
+            async def dispatched(**kwargs):
+                return await asyncio.to_thread(function, **kwargs)
+            return dispatched
+
+        for tool in mcp._tool_manager.list_tools():
+            if (tool.name not in {"py_exec", "py_cancel", "py_reset"}
+                    and (tool.name in analysis_tools or
+                         (tool.annotations is not None and tool.annotations.readOnlyHint is False))
+                    and "filename" in tool.parameters.get("properties", {})):
+                tool.fn = protect_edit(tool.fn, tool.is_async)
+            # Keep native analysis and filesystem waits off the transport loop.
+            # Cancellation/status only read bounded in-memory records, so they
+            # remain available even when all analysis executor workers are busy.
+            if not tool.is_async and tool.name not in control_tools:
+                tool.fn = offload(tool.fn)
+                tool.is_async = True
 
         log.log_info("Registered MCP tools")
 
