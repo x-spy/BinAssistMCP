@@ -40,6 +40,8 @@ src/binassist_mcp/
 ├── execution.py     # Bounded output and execution lifecycle records
 ├── execution_scope.py # Cooperative tracing and managed child-thread lifetimes
 ├── analysis_helpers.py # Script batching, IL and undo helpers
+├── function_context.py # UI-selected function, overlap and architecture resolution
+├── analysis_queries.py # Bounded cached IL, CFG and summary queries
 ├── plugin.py        # Binary Ninja plugin integration
 ├── context.py       # Thread-safe multi-binary session management
 ├── config.py        # Pydantic configuration with Binary Ninja settings
@@ -79,10 +81,10 @@ BinAssistMCP provides 48 tools organized into functional categories. Tools inclu
 ### Code Analysis (Consolidated)
 | Tool | Description |
 |------|-------------|
-| `get_code` | **Unified code retrieval** - supports formats: `decompile`, `hlil`, `mlil`, `llil`, `disasm`, `pseudo_c` |
-| `get_function_low_level_il` | Get Low-Level IL for a function |
-| `analyze_function` | Comprehensive function analysis with control flow and complexity metrics |
-| `get_basic_blocks` | Get basic block information for control flow analysis |
+| `get_code` | Cached IL instruction pages by default; explicit generation and full rendering are available |
+| `get_function_low_level_il` | Read a bounded cached LLIL page with the same generation policy as `get_code` |
+| `analyze_function` | Bounded function summary with explicit scanned-block coverage |
+| `get_basic_blocks` | Paged CFG blocks with separately paginated predecessor/successor edges |
 | `get_function_stack_layout` | Get stack frame layout with variable offsets |
 
 ### Cross-References (Consolidated)
@@ -293,6 +295,32 @@ http://localhost:9090/mcp
 ```
 http://localhost:9090/sse
 ```
+
+### Function Context and Bounded Queries
+
+`get_current_function` and `get_current_address` read a coherent selection from the Binary Ninja UI on its main thread. The selected function must belong to the requested BinaryView. If Binary Ninja is not in the foreground, a unique visible selection for that view is used; conflicting panes/windows produce `context_unavailable`. Headless mode does not fabricate a current UI cursor.
+
+Function queries accept an exact name, an entry address, or an interior address. A unique exact entry takes precedence for an explicit address; otherwise the selected UI function resolves overlapping owners. Without a reliable selection, overlapping functions return `ambiguous_function` with candidates rather than silently selecting the first result. Use `function_start`, `architecture`, and `platform` to select explicitly. Responses include the actual `function_start`, `architecture`, `platform`, `requested_address`, and `context_source`. Current-address disassembly uses the selected function's ISA, so a Thumb function inside an ARM-default view is decoded as Thumb. Function bounds are not treated as a contiguous range or computed by adding total bytes to the entry address.
+
+`get_code` defaults to `generate=false` and returns native IL instruction fragments, labelled by `representation`. `decompile` prefers cached HLIL, then cached MLIL, without silently substituting assembly. Missing IL returns `il_unavailable`; a generation request for a skipped function returns `analysis_skipped`. `generate=true` permits on-demand generation. Clearing a function's skip flag additionally requires `force_analysis=true`. The LLIL tool and legacy Python code-retrieval aliases follow the same policy. No query silently clears the skip flag.
+
+Code pages use `offset`, `limit` (default 100 instructions), and `max_output_bytes` (default 16 KiB). Reuse returned function selectors and `snapshot_id` for subsequent IL pages; changed IL returns `stale_page`. Inspect `has_more`, `next_offset`, `complete`, and `truncated`. Fragments are not a complete structured function listing. `full_render=true` explicitly requests native full-function formatting, which can be expensive even before pagination; its offsets and limits count characters instead of instructions.
+
+```json
+{
+  "filename": "sample.exe",
+  "function_name_or_address": "0x401020",
+  "function_start": "0x401000",
+  "architecture": "x86_64",
+  "format": "hlil",
+  "offset": 0,
+  "limit": 50
+}
+```
+
+`get_basic_blocks` returns an object containing `blocks`, `total_blocks`, `offset`, `next_offset`, `has_more`, `edges_complete`, and `complete`; it no longer returns an unbounded bare list. Defaults are 50 blocks, 16 edges per direction per block, and 32 KiB. Use `block_address` to inspect one block, then advance `edge_offset` using its `predecessors_page` or `successors_page`. A page that ends the block list may still have incomplete edge lists. Keep function selectors fixed and restart pagination after reanalysis, which can change block order.
+
+`analyze_function` scans at most 500 blocks by default. `block_scan` reports exactly which range its counts describe, with a continuation offset. Full instruction counts and the single-component cyclomatic estimate are returned only when all blocks were scanned. Instruction counts use the native instruction count, not byte length. Call-site counts are not labelled call depth, and backward address edges are not labelled loops.
 
 ### Python Console Execution
 

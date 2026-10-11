@@ -22,6 +22,7 @@ from collections import OrderedDict
 from .analysis_helpers import ScriptHelpers, analysis_state
 from .execution import DEFAULT_OUTPUT_BYTES, Execution, ExecutionCancelled, InputRequired
 from .execution_scope import ExecutionScope
+from .function_context import ContextResolutionError, current_ui_selection, resolve_function
 from .logging import log
 
 
@@ -87,7 +88,7 @@ class BinaryNinjaPythonConsole:
 
     def start(self, binary_view, source, address=None, timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
               mode="script", max_output_bytes=DEFAULT_OUTPUT_BYTES, function_start=None,
-              architecture=None, cancel_event=None, submitted_at=None):
+              architecture=None, platform=None, cancel_event=None, submitted_at=None):
         submitted_at = time.monotonic() if submitted_at is None else submitted_at
         timeout = self._validate_timeout(timeout_seconds)
         self._validate_source(source)
@@ -107,7 +108,7 @@ class BinaryNinjaPythonConsole:
                 linecache.cache.pop(f"<binassist:{expired}>", None)
             threading.Thread(target=self._run,
                              args=(execution, binary_view, source, address, mode,
-                                   function_start, architecture, cancel_event),
+                                   function_start, architecture, platform, cancel_event),
                              name=f"binassist-python-{execution.id[:8]}", daemon=True).start()
             return execution
 
@@ -218,8 +219,6 @@ class BinaryNinjaPythonConsole:
                                            "traceback": bounded_text(message, 16384)}
 
     def _default_address(self, view):
-        if self._bn.core_ui_enabled() and isinstance(getattr(view, "offset", None), int):
-            return view.offset
         if self._current_view is view and self._current_address is not None:
             return self._current_address
         return int(getattr(view, "entry_point", getattr(view, "start", 0)))
@@ -235,20 +234,23 @@ class BinaryNinjaPythonConsole:
             raise ValueError("Address must resolve to an unsigned 64-bit integer")
         return value
 
-    def _set_context(self, view, address, function_start, architecture):
-        resolved = self._resolve_address(view, function_start if address is None and function_start is not None else address)
-        if function_start is not None:
-            candidates = list(view.get_functions_at(self._resolve_address(view, function_start)))
-        else:
-            candidates = list(view.get_functions_containing(resolved))
-        if architecture:
-            candidates = [f for f in candidates if f.arch.name == architecture]
-        if len(candidates) > 1:
-            choices = ", ".join(f"{hex(f.start)} ({f.arch.name})" for f in candidates[:16])
-            raise ValueError(f"Ambiguous function; specify function_start/architecture: {choices}")
-        if (function_start is not None or architecture) and not candidates:
-            raise ValueError("No function matches the requested context")
-        function = candidates[0] if candidates else None
+    def _set_context(self, view, address, function_start, architecture, platform=None):
+        selection = current_ui_selection(view)
+        target = address if address is not None else function_start
+        if target is None:
+            target = selection.address if selection.address is not None else self._default_address(view)
+        resolved = self._resolve_address(view, target)
+        details = {"context_source": "explicit_address" if address is not None else "session_or_entry_point"}
+        try:
+            context = resolve_function(view, None if address is None and function_start is None and selection.address is not None else resolved,
+                                       function_start=function_start, architecture=architecture,
+                                       platform=platform, ui=selection)
+            function = context.function
+            details = context.metadata()
+        except ContextResolutionError as exc:
+            if exc.details["status"] != "function_not_found" or function_start is not None or architecture or platform:
+                raise
+            function = None
         block = function.get_basic_block_at(resolved) if function is not None else None
         self._instance.set_current_binary_view(view)
         self._instance.set_current_address(resolved)
@@ -256,7 +258,7 @@ class BinaryNinjaPythonConsole:
         self._instance.set_current_function(function)
         self._instance.set_current_basic_block(block)
         self._current_view, self._current_address = view, resolved
-        return {"address": hex(resolved), "function": getattr(function, "name", None),
+        return {**details, "address": hex(resolved), "function": getattr(function, "name", None),
                 "function_start": hex(function.start) if function is not None else None,
                 "architecture": getattr(getattr(function or view, "arch", None), "name", None)}
 
@@ -288,7 +290,7 @@ class BinaryNinjaPythonConsole:
                 args=[last.value], keywords=[],)), last)
         return compile(ast.fix_missing_locations(tree), filename, "exec", dont_inherit=True)
 
-    def _run(self, execution, view, source, address, mode, function_start, architecture, cancel_event):
+    def _run(self, execution, view, source, address, mode, function_start, architecture, platform, cancel_event):
         acquired = False
         try:
             with execution.lock:
@@ -300,7 +302,7 @@ class BinaryNinjaPythonConsole:
                 execution.checkpoint()
             acquired = True
             self._run_serialized(execution, view, source, address, mode,
-                                 function_start, architecture, cancel_event)
+                                 function_start, architecture, platform, cancel_event)
         except (ExecutionCancelled, InputRequired):
             execution.finish("cancelled")
         except BaseException as exc:
@@ -312,7 +314,7 @@ class BinaryNinjaPythonConsole:
             if self._closed:
                 self._dispose_native()
 
-    def _run_serialized(self, execution, view, source, address, mode, function_start, architecture, cancel_event):
+    def _run_serialized(self, execution, view, source, address, mode, function_start, architecture, platform, cancel_event):
         filename = f"<binassist:{execution.id}>"
         try:
             linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
@@ -322,7 +324,7 @@ class BinaryNinjaPythonConsole:
             if cancel_event is not None and cancel_event.is_set():
                 execution.request_cancel()
             execution.checkpoint()
-            execution.context.update(self._set_context(view, address, function_start, architecture))
+            execution.context.update(self._set_context(view, address, function_start, architecture, platform))
             execution.analysis_at_start = analysis_state(view)
             namespace = self._native_instance.interpreter.locals
             namespace["__binassist_run__"] = lambda: self._execute_payload(execution, view, code)

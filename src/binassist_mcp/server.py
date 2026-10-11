@@ -691,13 +691,13 @@ class BinAssistMCPServer:
 
         async def _begin_python(ctx, filename, code, address=None, timeout_seconds=30.0,
                                 session="default", mode="script", max_output_bytes=65536,
-                                function_start=None, architecture=None, cancel_event=None):
+                                function_start=None, architecture=None, platform=None, cancel_event=None):
             manager = ctx.request_context.lifespan_context
             submitted_at = time.monotonic()
             return await asyncio.to_thread(
                 manager.start_python, filename, code, address, timeout_seconds,
                 _python_scope(ctx, session), mode=mode, max_output_bytes=max_output_bytes,
-                function_start=function_start, architecture=architecture,
+                function_start=function_start, architecture=architecture, platform=platform,
                 cancel_event=cancel_event, submitted_at=submitted_at,
             )
 
@@ -706,7 +706,7 @@ class BinAssistMCPServer:
                           address: Optional[str] = None, timeout_seconds: float = 30.0,
                           session: str = "default", mode: str = "script", background: bool = False,
                           max_output_bytes: int = 65536, function_start: Optional[str] = None,
-                          architecture: Optional[str] = None) -> dict:
+                          architecture: Optional[str] = None, platform: Optional[str] = None) -> dict:
             """Run trusted Python as one complete script on the native interpreter.
 
             Variables persist per client, binary and named session. bv, here and
@@ -733,7 +733,7 @@ class BinAssistMCPServer:
             try:
                 execution = await _begin_python(
                     ctx, filename, code, address, timeout_seconds, session, mode,
-                    max_output_bytes, function_start, architecture, cancellation,
+                    max_output_bytes, function_start, architecture, platform, cancellation,
                 )
                 if isinstance(execution, dict):
                     return execution
@@ -1058,23 +1058,20 @@ class BinAssistMCPServer:
         # get_call_graph and get_cross_references consolidated into xrefs_tool()
 
         @mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
-        def analyze_function(filename: str, function_name_or_address: str, ctx: Context):
-            """Perform comprehensive analysis of a function
+        def analyze_function(filename: str, ctx: Context, function_name_or_address: str = "",
+                             function_start: Optional[str] = None, architecture: Optional[str] = None,
+                             platform: Optional[str] = None, block_offset: int = 0,
+                             block_limit: int = 500) -> dict:
+            """Read a bounded function summary with explicit coverage and count semantics.
 
-            Args:
-                filename: Name of the binary file
-                function_name_or_address: Function name or address
-
-            Returns:
-                Comprehensive function analysis including control flow, complexity, and call information
+            block_scan counts cover only that page. Full instruction count and
+            a cyclomatic estimate are returned only when the full CFG was scanned.
+            Call depth and loop count are not guessed from names/address ordering.
             """
-            context_manager: BinAssistMCPBinaryContextManager = ctx.request_context.lifespan_context
-            guard = _check_analysis_guard(context_manager, filename)
-            if guard:
-                return guard
-            binary_view = context_manager.get_binary(filename)
-            tools = BinAssistMCPTools(binary_view)
-            return tools.analyze_function(function_name_or_address)
+            manager = ctx.request_context.lifespan_context
+            return BinAssistMCPTools(manager.get_binary(filename)).analyze_function(
+                function_name_or_address, function_start=function_start, architecture=architecture,
+                platform=platform, block_offset=block_offset, block_limit=block_limit)
 
         @mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
         def get_function_signature(filename: str, function_name_or_address: str, ctx: Context) -> dict:
@@ -1182,9 +1179,6 @@ class BinAssistMCPServer:
                 Dictionary containing current address information with context
             """
             context_manager: BinAssistMCPBinaryContextManager = ctx.request_context.lifespan_context
-            guard = _check_analysis_guard(context_manager, filename)
-            if guard:
-                return guard
             binary_view = context_manager.get_binary(filename)
             tools = BinAssistMCPTools(binary_view)
             return tools.get_current_address()
@@ -1200,9 +1194,6 @@ class BinAssistMCPServer:
                 Dictionary containing current function name and address
             """
             context_manager: BinAssistMCPBinaryContextManager = ctx.request_context.lifespan_context
-            guard = _check_analysis_guard(context_manager, filename)
-            if guard:
-                return guard
             binary_view = context_manager.get_binary(filename)
             tools = BinAssistMCPTools(binary_view)
             return tools.get_current_function()
@@ -1211,28 +1202,29 @@ class BinAssistMCPServer:
         # These unified tools reduce tool count while maintaining functionality
 
         @mcp.tool(annotations=ANALYSIS_ANNOTATIONS)
-        def get_code(filename: str, function_name_or_address: str, ctx: Context,
-                    format: str = "decompile") -> dict:
-            """Get function code in specified format (unified tool).
+        def get_code(filename: str, ctx: Context, function_name_or_address: str = "",
+                     format: str = "decompile", function_start: Optional[str] = None,
+                     architecture: Optional[str] = None, platform: Optional[str] = None,
+                     offset: int = 0, limit: int = 100, max_output_bytes: int = 16384,
+                     generate: bool = False, force_analysis: bool = False,
+                     full_render: bool = False, snapshot_id: Optional[str] = None) -> dict:
+            """Read bounded native IL fragments or disassembly for an entry/name/interior address.
 
-            Consolidates: decompile_function, get_function_pseudo_c, get_function_high_level_il,
-            get_function_medium_level_il, get_disassembly, get_function_low_level_il
-
-            Args:
-                filename: Name of the binary file
-                function_name_or_address: Function identifier
-                format: Output format - 'decompile', 'hlil', 'mlil', 'llil', 'disasm', 'pseudo_c'
-
-            Returns:
-                Dictionary with function info and code
+            Omit the identifier to use the actual UI-selected function. Overlaps
+            require UI selection or explicit function_start/architecture/platform.
+            By default only cached IL is read. generate requests IL generation;
+            force_analysis additionally permits clearing the skip flag. Full
+            native function formatting is expensive and requires full_render.
+            offset/next_offset count instructions, or characters with full_render.
+            Reuse the returned function selectors and snapshot_id for later pages.
+            Inspect representation, complete, has_more and truncated before analysis.
             """
-            context_manager: BinAssistMCPBinaryContextManager = ctx.request_context.lifespan_context
-            guard = _check_analysis_guard(context_manager, filename)
-            if guard:
-                return guard
-            binary_view = context_manager.get_binary(filename)
-            tools = BinAssistMCPTools(binary_view)
-            return tools.get_code(function_name_or_address, format)
+            manager = ctx.request_context.lifespan_context
+            return BinAssistMCPTools(manager.get_binary(filename)).get_code(
+                function_name_or_address, format, function_start=function_start,
+                architecture=architecture, platform=platform, offset=offset, limit=limit,
+                max_output_bytes=max_output_bytes, generate=generate,
+                force_analysis=force_analysis, full_render=full_render, snapshot_id=snapshot_id)
 
         @mcp.tool(annotations=MODIFY_ANNOTATIONS)
         def comments(filename: str, action: str, ctx: Context,
@@ -1353,23 +1345,17 @@ class BinAssistMCPServer:
         # ==================== NEW TOOLS (Phase 7) ====================
 
         @mcp.tool(annotations=ANALYSIS_ANNOTATIONS)
-        def get_function_low_level_il(filename: str, address_or_name: str, ctx: Context) -> str:
-            """Get Low Level IL for a function.
-
-            Args:
-                filename: Name of the binary file
-                address_or_name: Function name or address
-
-            Returns:
-                LLIL as string
-            """
-            context_manager: BinAssistMCPBinaryContextManager = ctx.request_context.lifespan_context
-            guard = _check_analysis_guard(context_manager, filename)
-            if guard:
-                return guard
-            binary_view = context_manager.get_binary(filename)
-            tools = BinAssistMCPTools(binary_view)
-            return tools.get_function_low_level_il(address_or_name)
+        def get_function_low_level_il(filename: str, ctx: Context, address_or_name: str = "",
+                                      function_start: Optional[str] = None, architecture: Optional[str] = None,
+                                      platform: Optional[str] = None, offset: int = 0, limit: int = 100,
+                                      max_output_bytes: int = 16384, generate: bool = False,
+                                      force_analysis: bool = False, snapshot_id: Optional[str] = None) -> dict:
+            """Read a bounded cached LLIL page; explicit generation follows get_code policy."""
+            manager = ctx.request_context.lifespan_context
+            return BinAssistMCPTools(manager.get_binary(filename)).get_function_low_level_il(
+                address_or_name, function_start=function_start, architecture=architecture,
+                platform=platform, offset=offset, limit=limit, max_output_bytes=max_output_bytes,
+                generate=generate, force_analysis=force_analysis, snapshot_id=snapshot_id)
 
         @mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
         def search_strings(filename: str, pattern: str, ctx: Context,
@@ -1477,23 +1463,25 @@ class BinAssistMCPServer:
             return tools.export_program(output_path, format, overwrite)
 
         @mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
-        def get_basic_blocks(filename: str, function_name_or_address: str, ctx: Context) -> list:
-            """Get basic blocks for a function (CFG).
+        def get_basic_blocks(filename: str, ctx: Context, function_name_or_address: str = "",
+                             function_start: Optional[str] = None, architecture: Optional[str] = None,
+                             platform: Optional[str] = None, offset: int = 0, limit: int = 50,
+                             block_address: Optional[str] = None, edge_offset: int = 0,
+                             edge_limit: int = 16, max_output_bytes: int = 32768) -> dict:
+            """Read a bounded CFG block page for a uniquely resolved function.
 
-            Args:
-                filename: Name of the binary file
-                function_name_or_address: Function identifier
-
-            Returns:
-                List of basic blocks
+            blocks have separately paginated predecessors/successors. Select
+            block_address and advance edge_offset to inspect a high-degree node.
+            next_offset continues blocks; complete is false for partial graphs.
+            Preserve returned function selectors across pages. Reanalysis can
+            change block ordering, so restart pagination after analysis changes.
             """
-            context_manager: BinAssistMCPBinaryContextManager = ctx.request_context.lifespan_context
-            guard = _check_analysis_guard(context_manager, filename)
-            if guard:
-                return guard
-            binary_view = context_manager.get_binary(filename)
-            tools = BinAssistMCPTools(binary_view)
-            return tools.get_basic_blocks(function_name_or_address)
+            manager = ctx.request_context.lifespan_context
+            return BinAssistMCPTools(manager.get_binary(filename)).get_basic_blocks(
+                function_name_or_address, function_start=function_start,
+                architecture=architecture, platform=platform, offset=offset, limit=limit,
+                block_address=block_address, edge_offset=edge_offset, edge_limit=edge_limit,
+                max_output_bytes=max_output_bytes)
 
         @mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
         def get_function_stack_layout(filename: str, function_name_or_address: str, ctx: Context) -> dict:

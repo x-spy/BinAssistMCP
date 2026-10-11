@@ -12,6 +12,9 @@ from pathlib import Path
 
 from .function_signature_generator import BinaryNinjaFunctionSignatureGenerator
 from .logging import log
+from .function_context import (ContextResolutionError, current_ui_selection, describe_function,
+                               context_result, function_key, instruction_at, resolve_function)
+from .analysis_queries import block_page, code_page, function_summary
 
 try:
     import binaryninja as bn
@@ -58,6 +61,9 @@ class BinAssistMCPTools:
         self.bv = binary_view
         if not self.bv:
             raise ValueError("Binary view cannot be None")
+
+    def _function_context(self, identifier=None, **selectors):
+        return resolve_function(self.bv, identifier, **selectors)
             
     def _resolve_symbol(self, address_or_name: str) -> Optional[int]:
         """Resolve a symbol name or address to a numeric address
@@ -115,57 +121,24 @@ class BinAssistMCPTools:
         return None
         
     def _get_function_by_name_or_address(self, identifier: Union[str, int]):
-        """Get a function by name or address"""
-        # Handle address-based lookup
+        """Resolve exact names, entries or interior addresses without guessing."""
         try:
-            if isinstance(identifier, str) and identifier.startswith("0x"):
-                addr = int(identifier, 16)
-            elif isinstance(identifier, (int, str)):
-                addr = int(identifier) if isinstance(identifier, str) else identifier
-                
-            func = self.bv.get_function_at(addr)
-            if func:
-                return func
-        except ValueError:
-            pass
-            
-        # Handle name-based lookup
-        for func in self.bv.functions:
-            if func.name == identifier:
-                return func
-                
-        # Try case-insensitive match
-        for func in self.bv.functions:
-            if func.name.lower() == str(identifier).lower():
-                return func
-                
-        # Try symbol lookup
-        symbol = self.bv.get_symbol_by_raw_name(str(identifier))
-        if symbol and symbol.address:
-            func = self.bv.get_function_at(symbol.address)
-            if func:
-                return func
-                
-        return None
+            return self._function_context(identifier).function
+        except ContextResolutionError as exc:
+            if exc.details["status"] in {"function_not_found", "invalid_address"}:
+                return None
+            raise
 
     def _get_function_containing_or_at(self, addr: int):
-        """Resolve an address to the function that owns it."""
-        func = self.bv.get_function_at(addr)
-        if func:
-            return func
-
-        funcs = self.bv.get_functions_containing(addr)
-        if funcs:
-            return funcs[0]
-
-        return None
+        return self._get_function_by_name_or_address(addr)
 
     def _get_call_target_functions(self, call_site) -> List[Any]:
         """Resolve function call targets for a call site."""
         targets = []
         seen = set()
 
-        for attr in ("destination", "dest", "function", "callee"):
+        # ReferenceSource.function is the caller, not a call destination.
+        for attr in ("destination", "dest", "callee"):
             target = getattr(call_site, attr, None)
             if target is None:
                 continue
@@ -176,19 +149,20 @@ class BinAssistMCPTools:
             elif isinstance(target, int):
                 target_func = self.bv.get_function_at(target)
 
-            if target_func and target_func.start not in seen:
-                seen.add(target_func.start)
+            if target_func and function_key(target_func) not in seen:
+                seen.add(function_key(target_func))
                 targets.append(target_func)
 
         site_addr = getattr(call_site, "address", None)
         if site_addr is None:
             return targets
 
-        for target_addr in self.bv.get_code_refs_from(site_addr):
-            target_func = self.bv.get_function_at(target_addr)
-            if target_func and target_func.start not in seen:
-                seen.add(target_func.start)
-                targets.append(target_func)
+        for target_addr in self.bv.get_code_refs_from(site_addr, func=getattr(call_site, "function", None),
+                                                      arch=getattr(call_site, "arch", None)):
+            for target_func in self.bv.get_functions_at(target_addr):
+                if function_key(target_func) not in seen:
+                    seen.add(function_key(target_func))
+                    targets.append(target_func)
 
         return targets
 
@@ -253,17 +227,9 @@ class BinAssistMCPTools:
         }
 
     def _get_arch_for_address(self, addr: int):
-        """Resolve the best Binary Ninja architecture for an address."""
-        funcs = self.bv.get_functions_containing(addr)
-        if funcs:
-            arch = getattr(funcs[0], "arch", None)
-            if arch:
-                return arch
-        arch = getattr(self.bv, "arch", None)
-        if arch:
-            return arch
-        raise ValueError(f"Could not determine architecture at {hex(addr)}")
-        
+        """Use unambiguous function ownership for mixed-ISA operations."""
+        return self._function_context(addr).function.arch
+
     # Core analysis tools
     @handle_exceptions
     @require_binja
@@ -330,130 +296,24 @@ class BinAssistMCPTools:
         
     @handle_exceptions
     @require_binja
-    def decompile_function(self, address_or_name: str) -> str:
-        """Decompile a function to high-level representation
-        
-        Args:
-            address_or_name: Function name or address
-            
-        Returns:
-            Decompiled function code
-        """
-        func = self._get_function_by_name_or_address(address_or_name)
-        if not func:
-            raise ValueError(f"Function not found: {address_or_name}")
-            
-        # Ensure analysis is complete
-        func.analysis_skipped = False
-        self.bv.update_analysis_and_wait()
-        
-        # Try High Level IL first
-        if hasattr(func, 'hlil') and func.hlil:
-            return str(func.hlil)
-        # Fall back to Medium Level IL
-        elif hasattr(func, 'mlil') and func.mlil:
-            return str(func.mlil)
-        # Last resort: basic function representation
-        else:
-            return str(func)
-            
+    def decompile_function(self, address_or_name, **options):
+        return self.get_code(address_or_name, format="decompile", **options)
+
     @handle_exceptions
     @require_binja
-    def get_function_pseudo_c(self, address_or_name: str) -> str:
-        """Get pseudo C code for a function
-        
-        Args:
-            address_or_name: Function name or address
-            
-        Returns:
-            Pseudo C code as string
-        """
-        addr = self._resolve_symbol(address_or_name)
-        if addr is None:
-            raise ValueError(f"No function found with name/address '{address_or_name}'")
-            
-        func = self.bv.get_function_at(addr)
-        if not func:
-            raise ValueError(f"No function found at address {hex(addr)}")
-            
-        lines = []
-        settings = bn.DisassemblySettings()
-        settings.set_option(bn.DisassemblyOption.ShowAddress, False)
-        settings.set_option(bn.DisassemblyOption.WaitForIL, True)
-        
-        obj = bn.LinearViewObject.language_representation(self.bv, settings)
-        cursor_end = bn.LinearViewCursor(obj)
-        cursor_end.seek_to_address(func.highest_address)
-        
-        body = self.bv.get_next_linear_disassembly_lines(cursor_end)
-        cursor_end.seek_to_address(func.highest_address)
-        header = self.bv.get_previous_linear_disassembly_lines(cursor_end)
-        
-        for line in header:
-            lines.append(f"{str(line)}\n")
-        for line in body:
-            lines.append(f"{str(line)}\n")
-            
-        return ''.join(lines)
-        
+    def get_function_pseudo_c(self, address_or_name, **options):
+        return self.get_code(address_or_name, format="pseudo_c", **options)
+
     @handle_exceptions
     @require_binja
-    def get_function_high_level_il(self, address_or_name: str) -> str:
-        """Get High Level IL for a function
-        
-        Args:
-            address_or_name: Function name or address
-            
-        Returns:
-            HLIL as string
-        """
-        addr = self._resolve_symbol(address_or_name)
-        if addr is None:
-            raise ValueError(f"No function found with name/address '{address_or_name}'")
-            
-        func = self.bv.get_function_at(addr)
-        if not func:
-            raise ValueError(f"No function found at address {hex(addr)}")
-            
-        hlil = func.hlil
-        if not hlil:
-            raise ValueError(f"Failed to get HLIL for function at {hex(addr)}")
-            
-        lines = []
-        for instruction in hlil.instructions:
-            lines.append(f"{instruction.address:#x}: {instruction}\n")
-            
-        return ''.join(lines)
-        
+    def get_function_high_level_il(self, address_or_name, **options):
+        return self.get_code(address_or_name, format="hlil", **options)
+
     @handle_exceptions
     @require_binja
-    def get_function_medium_level_il(self, address_or_name: str) -> str:
-        """Get Medium Level IL for a function
-        
-        Args:
-            address_or_name: Function name or address
-            
-        Returns:
-            MLIL as string
-        """
-        addr = self._resolve_symbol(address_or_name)
-        if addr is None:
-            raise ValueError(f"No function found with name/address '{address_or_name}'")
-            
-        func = self.bv.get_function_at(addr)
-        if not func:
-            raise ValueError(f"No function found at address {hex(addr)}")
-            
-        mlil = func.mlil
-        if not mlil:
-            raise ValueError(f"Failed to get MLIL for function at {hex(addr)}")
-            
-        lines = []
-        for instruction in mlil.instructions:
-            lines.append(f"{instruction.address:#x}: {instruction}\n")
-            
-        return ''.join(lines)
-        
+    def get_function_medium_level_il(self, address_or_name, **options):
+        return self.get_code(address_or_name, format="mlil", **options)
+
     @handle_exceptions
     @require_binja
     def get_disassembly(self, address_or_name: str, length: Optional[int] = None) -> str:
@@ -1033,9 +893,9 @@ class BinAssistMCPTools:
             addr: Address to set comment at
             comment: Comment text (empty string to clear)
         """
-        funcs = self.bv.get_functions_containing(addr)
-        if funcs:
-            funcs[0].set_comment_at(addr, comment)
+        function = self._get_function_containing_or_at(addr)
+        if function is not None:
+            function.set_comment_at(addr, comment)
         else:
             self.bv.set_comment_at(addr, comment)
 
@@ -1052,9 +912,9 @@ class BinAssistMCPTools:
             Comment text or None if no comment exists
         """
         # Check function-level comments first
-        funcs = self.bv.get_functions_containing(addr)
-        if funcs:
-            comment = funcs[0].get_comment_at(addr)
+        function = self._get_function_containing_or_at(addr)
+        if function is not None:
+            comment = function.get_comment_at(addr)
             if comment:
                 return comment
         # Fall back to BV-level comments
@@ -1071,10 +931,10 @@ class BinAssistMCPTools:
         """
         removed = False
         # Remove function-level comment if exists
-        funcs = self.bv.get_functions_containing(addr)
-        if funcs:
-            if funcs[0].get_comment_at(addr):
-                funcs[0].set_comment_at(addr, "")
+        function = self._get_function_containing_or_at(addr)
+        if function is not None:
+            if function.get_comment_at(addr):
+                function.set_comment_at(addr, "")
                 removed = True
         # Also remove BV-level comment if exists
         if self.bv.get_comment_at(addr):
@@ -1163,7 +1023,7 @@ class BinAssistMCPTools:
             if addr not in seen_addresses and comment:
                 # Try to find containing function for context
                 funcs = self.bv.get_functions_containing(addr)
-                func_name = funcs[0].name if funcs else None
+                func_name = funcs[0].name if len(funcs) == 1 else None
                 comments.append({
                     "address": hex(addr),
                     "type": "address",
@@ -1650,72 +1510,13 @@ class BinAssistMCPTools:
             
     @handle_exceptions
     @require_binja
-    def analyze_function(self, function_name_or_address: str) -> Dict[str, Any]:
-        """Perform comprehensive analysis of a function
-        
-        Args:
-            function_name_or_address: Function name or address
-            
-        Returns:
-            Comprehensive function analysis
-        """
-        func = self._get_function_by_name_or_address(function_name_or_address)
-        if not func:
-            raise ValueError(f"Function not found: {function_name_or_address}")
-            
-        # Basic function info
-        analysis = {
-            "name": func.name,
-            "address": hex(func.start),
-            "size": func.total_bytes,
-            "basic_block_count": len(list(func.basic_blocks)),
-            "instruction_count": sum(len(bb) for bb in func.basic_blocks),
-            "parameter_count": len(func.parameter_vars),
-            "local_variable_count": len(func.vars) - len(func.parameter_vars),
-            "complexity": {
-                "cyclomatic": self._calculate_cyclomatic_complexity(func),
-                "call_depth": len(list(func.call_sites))
-            }
-        }
-        
-        # Control flow analysis
-        analysis["control_flow"] = {
-            "entry_point": hex(func.start),
-            "exit_points": [hex(bb.end) for bb in func.basic_blocks if len(bb.outgoing_edges) == 0],
-            "branch_count": sum(1 for bb in func.basic_blocks if len(bb.outgoing_edges) > 1),
-            "loop_count": self._count_loops(func)
-        }
-        
-        # Call analysis
-        calls_to = []
-        for call_site in func.call_sites:
-            try:
-                if hasattr(call_site, 'address'):
-                    for called_func in self._get_call_target_functions(call_site):
-                        calls_to.append(called_func.name)
-            except Exception as e:
-                log.log_debug(f"Error processing call_site in analyze_function: {e}")
-                continue
-                
-        analysis["calls"] = {
-            "outgoing": calls_to,
-            "incoming": [caller.name for caller in func.callers],
-            "external_calls": [call for call in calls_to if call.startswith("sub_") or "@" in call]
-        }
-        
-        # Type information
-        analysis["types"] = {
-            "return_type": str(func.return_type) if func.return_type else "void",
-            "parameters": [
-                {
-                    "name": param.name,
-                    "type": self._get_variable_type_safe(func, param)
-                }
-                for param in func.parameter_vars
-            ]
-        }
-        
-        return analysis
+    @context_result
+    def analyze_function(self, function_name_or_address=None, *, function_start=None,
+                         architecture=None, platform=None, block_offset=0, block_limit=500):
+        """Read a summary whose counts explicitly identify their scanned block range."""
+        context = self._function_context(function_name_or_address, function_start=function_start,
+                                         architecture=architecture, platform=platform)
+        return function_summary(self.bv, context, block_offset=block_offset, block_limit=block_limit)
 
     @handle_exceptions
     @require_binja
@@ -2072,127 +1873,48 @@ class BinAssistMCPTools:
         
     @handle_exceptions
     @require_binja
+    @context_result
     def get_current_address(self) -> Dict[str, Any]:
-        """Get the current address/offset in the binary view
-        
-        Returns:
-            Dictionary containing current address information
-        """
-        if not hasattr(self.bv, 'offset'):
-            # Fallback: try to get the entry point or first function
-            if self.bv.entry_points:
-                current_addr = self.bv.entry_points[0]
-            elif self.bv.functions:
-                current_addr = next(iter(self.bv.functions)).start
-            else:
-                current_addr = self.bv.start
-            
-            return {
-                "address": hex(current_addr),
-                "decimal": current_addr,
-                "note": "No current offset available, showing entry point or start address",
-                "has_current_offset": False
-            }
-        
-        current_addr = self.bv.offset
-        
-        # Get additional context about this address
-        result = {
-            "address": hex(current_addr),
-            "decimal": current_addr,
-            "has_current_offset": True
-        }
-        
-        # Check if address is in a function
-        functions = self.bv.get_functions_containing(current_addr)
-        if functions:
-            func = functions[0]  # Take the first function if multiple
-            result["in_function"] = {
-                "name": func.name,
-                "start": hex(func.start),
-                "end": hex(func.start + func.total_bytes),
-                "offset_in_function": current_addr - func.start
-            }
-        else:
-            result["in_function"] = None
-            
-        # Check if address has a symbol
-        symbol = self.bv.get_symbol_at(current_addr)
-        if symbol:
-            result["symbol"] = {
-                "name": symbol.name,
-                "type": str(symbol.type)
-            }
-        else:
-            result["symbol"] = None
-            
-        # Check if it's in a segment
-        for segment in self.bv.segments:
-            if segment.start <= current_addr < segment.end:
-                result["segment"] = {
-                    "start": hex(segment.start),
-                    "end": hex(segment.end),
-                    "readable": segment.readable,
-                    "writable": segment.writable,
-                    "executable": segment.executable
-                }
-                break
-        else:
-            result["segment"] = None
-            
-        # Try to get disassembly at current address
+        """Read one coherent UI selection and its function-specific instruction."""
+        selection = current_ui_selection(self.bv)
+        if selection.address is None:
+            return {"success": False, "status": "context_unavailable", "address": None,
+                    "has_current_offset": False, "message": selection.reason, "disassembly": None}
+        address = selection.address
+        result = {"success": True, "status": "ok", "address": hex(address), "decimal": address,
+                  "has_current_offset": True, "context_source": selection.source,
+                  "in_function": None, "disassembly": None}
         try:
-            disasm = self.bv.get_disassembly(current_addr)
-            if disasm:
-                result["disassembly"] = disasm
-        except:
-            result["disassembly"] = None
-            
+            context = resolve_function(self.bv, ui=selection)
+        except ContextResolutionError as exc:
+            result.update(exc.details)
+            return result
+        function = context.function
+        result.update(context.metadata())
+        result["in_function"] = describe_function(function)
+        result["in_function"].update(lowest_address=hex(function.lowest_address),
+                                      highest_address=hex(function.highest_address),
+                                      address_range_kind="bounds_only")
+        result.update(instruction_at(self.bv, address, function))
+        symbol = self.bv.get_symbol_at(address)
+        result["symbol"] = {"name": symbol.name, "type": str(symbol.type)} if symbol else None
+        segment = self.bv.get_segment_at(address)
+        result["segment"] = ({"start": hex(segment.start), "end": hex(segment.end),
+                              "readable": segment.readable, "writable": segment.writable,
+                              "executable": segment.executable} if segment else None)
         return result
-        
+
     @handle_exceptions
     @require_binja
+    @context_result
     def get_current_function(self) -> Dict[str, Any]:
-        """Get the current function (function containing the current address)
-        
-        Returns:
-            Dictionary containing current function name and address
-        """
-        if not hasattr(self.bv, 'offset'):
-            return {
-                "error": "No current offset available",
-                "has_current_offset": False
-            }
-            
-        current_addr = self.bv.offset
-        
-        # Get functions containing the current address
-        functions = self.bv.get_functions_containing(current_addr)
-        
-        if not functions:
-            return {
-                "current_address": hex(current_addr),
-                "function": None,
-                "message": "Current address is not within any function"
-            }
-            
-        # If multiple functions contain this address, take the first one
-        func = functions[0]
-        
-        result = {
-            "current_address": hex(current_addr),
-            "function": {
-                "name": func.name,
-                "address": hex(func.start)
-            }
-        }
-        
-        # If there are multiple functions at this address, note them
-        if len(functions) > 1:
-            result["note"] = f"Multiple functions at this address ({len(functions)} total)"
-            
+        """Return the UI-selected function, never the first overlapping owner."""
+        context = self._function_context()
+        result = {"success": True, "status": "ok", "current_address": hex(context.address),
+                  **context.metadata()}
+        result["function"] = describe_function(context.function)
         return result
-        
+
     def _get_variable_type_safe(self, func, var) -> str:
         """Safely get variable type with fallbacks for API compatibility
 
@@ -2220,123 +1942,17 @@ class BinAssistMCPTools:
 
     @handle_exceptions
     @require_binja
-    def get_code(self, function_name_or_address: str, format: str = "decompile") -> Dict[str, Any]:
-        """Get function code in specified format.
-
-        Unified tool consolidating: decompile_function, get_function_pseudo_c,
-        get_function_high_level_il, get_function_medium_level_il, get_disassembly,
-        get_function_low_level_il
-
-        Args:
-            function_name_or_address: Function identifier (name or hex address)
-            format: Output format - one of:
-                - 'decompile': High-level decompiled code (default)
-                - 'hlil': High Level Intermediate Language
-                - 'mlil': Medium Level Intermediate Language
-                - 'llil': Low Level Intermediate Language
-                - 'disasm': Assembly disassembly
-                - 'pseudo_c': Pseudo C code
-
-        Returns:
-            Dictionary with function info and code in requested format
-        """
-        func = self._get_function_by_name_or_address(function_name_or_address)
-        if not func:
-            raise ValueError(f"Function not found: {function_name_or_address}")
-
-        result = {
-            "function": func.name,
-            "address": hex(func.start),
-            "format": format,
-            "code": None
-        }
-
-        if format == "decompile":
-            # Use existing decompile logic
-            func.analysis_skipped = False
-            self.bv.update_analysis_and_wait()
-            if hasattr(func, 'hlil') and func.hlil:
-                result["code"] = str(func.hlil)
-            elif hasattr(func, 'mlil') and func.mlil:
-                result["code"] = str(func.mlil)
-            else:
-                lines = []
-                for block in func.basic_blocks:
-                    for i in range(block.start, block.end):
-                        disasm = self.bv.get_disassembly(i)
-                        if disasm:
-                            lines.append(f"{hex(i)}: {disasm}")
-                result["code"] = "\n".join(lines)
-
-        elif format == "hlil":
-            func.analysis_skipped = False
-            self.bv.update_analysis_and_wait()
-            if hasattr(func, 'hlil') and func.hlil:
-                lines = []
-                for block in func.hlil:
-                    for instr in block:
-                        lines.append(str(instr))
-                result["code"] = "\n".join(lines)
-            else:
-                result["code"] = "HLIL not available for this function"
-
-        elif format == "mlil":
-            func.analysis_skipped = False
-            self.bv.update_analysis_and_wait()
-            if hasattr(func, 'mlil') and func.mlil:
-                lines = []
-                for block in func.mlil:
-                    for instr in block:
-                        lines.append(str(instr))
-                result["code"] = "\n".join(lines)
-            else:
-                result["code"] = "MLIL not available for this function"
-
-        elif format == "llil":
-            func.analysis_skipped = False
-            self.bv.update_analysis_and_wait()
-            if hasattr(func, 'llil') and func.llil:
-                lines = []
-                for block in func.llil:
-                    for instr in block:
-                        lines.append(f"{hex(instr.address)}: {instr}")
-                result["code"] = "\n".join(lines)
-            else:
-                result["code"] = "LLIL not available for this function"
-
-        elif format == "disasm":
-            lines = []
-            for block in func.basic_blocks:
-                for i in range(block.start, block.end):
-                    disasm = self.bv.get_disassembly(i)
-                    if disasm:
-                        lines.append(f"{hex(i)}: {disasm}")
-            result["code"] = "\n".join(lines)
-
-        elif format == "pseudo_c":
-            func.analysis_skipped = False
-            self.bv.update_analysis_and_wait()
-            if hasattr(func, 'hlil') and func.hlil:
-                # Build pseudo-C representation
-                code_lines = []
-                params = ", ".join([
-                    f"{self._get_variable_type_safe(func, p)} {p.name}"
-                    for p in func.parameter_vars
-                ]) if func.parameter_vars else "void"
-                return_type = str(func.return_type) if func.return_type else "void"
-                code_lines.append(f"{return_type} {func.name}({params}) {{")
-                for block in func.hlil:
-                    for instr in block:
-                        code_lines.append(f"    {instr}")
-                code_lines.append("}")
-                result["code"] = "\n".join(code_lines)
-            else:
-                result["code"] = "Pseudo-C not available (HLIL unavailable)"
-
-        else:
-            raise ValueError(f"Unknown format: {format}. Valid: decompile, hlil, mlil, llil, disasm, pseudo_c")
-
-        return result
+    @context_result
+    def get_code(self, function_name_or_address=None, format="decompile", *,
+                 function_start=None, architecture=None, platform=None, offset=0, limit=100,
+                 max_output_bytes=16384, generate=False, force_analysis=False,
+                 full_render=False, snapshot_id=None):
+        """Read cached IL fragments by default; generation and full rendering are explicit."""
+        context = self._function_context(function_name_or_address, function_start=function_start,
+                                         architecture=architecture, platform=platform)
+        return code_page(self.bv, context, format=format, offset=offset, limit=limit,
+                         max_output_bytes=max_output_bytes, generate=generate,
+                         force_analysis=force_analysis, full_render=full_render, snapshot_id=snapshot_id)
 
     @handle_exceptions
     @require_binja
@@ -2581,12 +2197,12 @@ class BinAssistMCPTools:
         if addr is None and func is None:
             raise ValueError(f"Could not resolve: {address_or_name}")
 
-        if addr:
+        if addr is not None:
             # Get references TO this address
             if direction in ("to", "both"):
                 refs = self.bv.get_code_refs(addr)
                 for ref in refs:
-                    ref_func = self._get_function_containing_or_at(ref.address)
+                    ref_func = getattr(ref, "function", None)
                     result["references_to"].append({
                         "address": hex(ref.address),
                         "function": ref_func.name if ref_func else None
@@ -2595,14 +2211,19 @@ class BinAssistMCPTools:
             # Get references FROM this address (if it's a function)
             if direction in ("from", "both") and func:
                 for block in func.basic_blocks:
-                    for i in range(block.start, block.end):
-                        for ref in self.bv.get_code_refs_from(i):
-                            target_func = self.bv.get_function_at(ref)
+                    i = block.start
+                    for _, length in block:
+                        for ref in self.bv.get_code_refs_from(i, func=func, arch=block.arch):
+                            targets = list(self.bv.get_functions_at(ref))
+                            target_func = targets[0] if len(targets) == 1 else None
                             result["references_from"].append({
                                 "from_address": hex(i),
                                 "to_address": hex(ref),
-                                "to_function": target_func.name if target_func else None
+                                "to_function": target_func.name if target_func else None,
+                                "target_candidates": [describe_function(f) for f in targets[:16]],
+                                "ambiguous_target": len(targets) > 1,
                             })
+                        i += length
 
         # Include call graph if requested
         if include_calls and func:
@@ -2615,7 +2236,7 @@ class BinAssistMCPTools:
 
             # Get callers
             for ref in self.bv.get_code_refs(func.start):
-                caller_func = self._get_function_containing_or_at(ref.address)
+                caller_func = getattr(ref, "function", None)
                 if caller_func and caller_func != func:
                     result["call_graph"]["callers"].append({
                         "name": caller_func.name,
@@ -2634,30 +2255,9 @@ class BinAssistMCPTools:
 
     @handle_exceptions
     @require_binja
-    def get_function_low_level_il(self, address_or_name: str) -> str:
-        """Get Low Level IL for a function.
-
-        Args:
-            address_or_name: Function name or address
-
-        Returns:
-            LLIL as string
-        """
-        func = self._get_function_by_name_or_address(address_or_name)
-        if not func:
-            raise ValueError(f"Function not found: {address_or_name}")
-
-        func.analysis_skipped = False
-        self.bv.update_analysis_and_wait()
-
-        if hasattr(func, 'llil') and func.llil:
-            lines = []
-            for block in func.llil:
-                for instr in block:
-                    lines.append(f"{hex(instr.address)}: {instr}")
-            return "\n".join(lines)
-
-        return "LLIL not available for this function"
+    def get_function_low_level_il(self, address_or_name=None, **options):
+        """Compatibility entry point with the same bounded, cached-only policy as get_code."""
+        return self.get_code(address_or_name, format="llil", **options)
 
     @handle_exceptions
     @require_binja
@@ -2750,7 +2350,7 @@ class BinAssistMCPTools:
 
             # Check if in a function
             funcs = self.bv.get_functions_containing(found)
-            func_name = funcs[0].name if funcs else None
+            func_name = funcs[0].name if len(funcs) == 1 else None
 
             results.append({
                 "address": hex(found),
@@ -2881,48 +2481,16 @@ class BinAssistMCPTools:
 
     @handle_exceptions
     @require_binja
-    def get_basic_blocks(self, function_name_or_address: str) -> List[Dict[str, Any]]:
-        """Get basic blocks for a function (control flow graph).
-
-        Args:
-            function_name_or_address: Function identifier
-
-        Returns:
-            List of basic blocks with addresses, instructions, and successors
-        """
-        func = self._get_function_by_name_or_address(function_name_or_address)
-        if not func:
-            raise ValueError(f"Function not found: {function_name_or_address}")
-
-        blocks = []
-        for block in func.basic_blocks:
-            block_info = {
-                "start": hex(block.start),
-                "end": hex(block.end),
-                "length": block.length,
-                "instruction_count": block.instruction_count,
-                "successors": [],
-                "predecessors": []
-            }
-
-            # Get successors
-            for edge in block.outgoing_edges:
-                if edge.target:
-                    block_info["successors"].append({
-                        "address": hex(edge.target.start),
-                        "type": str(edge.type)
-                    })
-
-            # Get predecessors
-            for edge in block.incoming_edges:
-                if edge.source:
-                    block_info["predecessors"].append({
-                        "address": hex(edge.source.start)
-                    })
-
-            blocks.append(block_info)
-
-        return blocks
+    @context_result
+    def get_basic_blocks(self, function_name_or_address=None, *, function_start=None,
+                         architecture=None, platform=None, offset=0, limit=50,
+                         block_address=None, edge_offset=0, edge_limit=16,
+                         max_output_bytes=32768):
+        """Return a bounded block page with independently paged edges."""
+        context = self._function_context(function_name_or_address, function_start=function_start,
+                                         architecture=architecture, platform=platform)
+        return block_page(self.bv, context, offset=offset, limit=limit, block_address=block_address,
+                          edge_offset=edge_offset, edge_limit=edge_limit, max_output_bytes=max_output_bytes)
 
     @handle_exceptions
     @require_binja

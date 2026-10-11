@@ -25,7 +25,7 @@ class BinaryNinjaFunctionSignatureGenerator:
         tokens: List[str] = []
         for address in self._iter_instruction_addresses(function):
             try:
-                length = int(self.binary_view.get_instruction_length(address) or 0)
+                length = int(self.binary_view.get_instruction_length(address, arch=function.arch) or 0)
             except Exception:
                 length = 0
             if length <= 0:
@@ -36,7 +36,7 @@ class BinaryNinjaFunctionSignatureGenerator:
                 continue
 
             try:
-                text = self.binary_view.get_disassembly(address) or ""
+                text = self.binary_view.get_disassembly(address, arch=function.arch) or ""
             except Exception:
                 text = ""
 
@@ -55,8 +55,11 @@ class BinaryNinjaFunctionSignatureGenerator:
         addresses: List[int] = []
         for basic_block in getattr(function, "basic_blocks", []) or []:
             for line in getattr(basic_block, "disassembly_text", []) or []:
-                address = int(getattr(line, "address", 0) or 0)
-                if not address or address in seen_addresses:
+                value = getattr(line, "address", None)
+                if value is None:
+                    continue
+                address = int(value)
+                if address in seen_addresses:
                     continue
                 seen_addresses.add(address)
                 addresses.append(address)
